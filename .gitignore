@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local Codex instructions, workspace notes, and analysis reports
+AGENTS.md
+AGENTS.override.md
+.codex/
+.agents/
+/.codex-local/

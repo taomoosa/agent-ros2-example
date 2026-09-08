@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>ros2_agent_server</name>
+  <version>0.1.0</version>
+  <description>FastAPI gateway and robot state/action bridge in rclpy.</description>
+  <maintainer email="maintainers@example.com">agent-ros2-example maintainers</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>ros2_agent_interfaces</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>python3-fastapi</exec_depend>
+  <exec_depend>python3-uvicorn</exec_depend>
+  <exec_depend>python3-pydantic</exec_depend>
+  <exec_depend>python3-pil</exec_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

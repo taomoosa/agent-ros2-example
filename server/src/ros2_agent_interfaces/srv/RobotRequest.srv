@@ -1,0 +1,10 @@
+# Internal bridge protocol. Commands must respond after completion.
+string operation
+string resource_id
+string payload_json
+float64 timeout_sec
+---
+int32 status_code
+string payload_json
+uint8[] data
+string content_type
