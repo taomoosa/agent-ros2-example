@@ -21,6 +21,11 @@ See [server/README.md](server/README.md) for server prerequisites, build command
 and startup instructions. Configure matching arm IDs, camera IDs, and coordinate
 frames on both sides.
 
+The [hardware integration guide](server/docs/integration.md) lists what to
+configure and implement for the server and ROS2 driver, including a one-arm,
+one-fixed-camera setup. The [extension guide](server/docs/extending.md) maps new
+tools and ROS capabilities to the files, driver contracts and tests to update.
+
 ```bash
 cd agent
 export GEMINI_API_KEY='your-api-key'
@@ -29,7 +34,8 @@ python run_ros2.py --config configs/single_arm.json \
   --model "$GEMINI_LIVE_MODEL" --task-file apps/inspect.md
 ```
 
-`configs/single_arm.json` and `configs/dual_arm.json` define the HTTP endpoint,
+`configs/minimal.json` (one fixed camera and one arm), `configs/single_arm.json`,
+and `configs/dual_arm.json` define the HTTP endpoint,
 arm IDs, base and flange frames, camera IDs, optical frames, and camera mounts.
 World-mounted cameras use `mount: "world"`. Flange-mounted cameras use
 `mount: "flange"` and `arm_id` to identify the arm they move with. Images are
@@ -37,16 +43,26 @@ combined into a grid in configuration order, with labels when there is more than
 one camera. Captures across cameras are not strictly synchronized. Failed
 captures are not replaced with cached images.
 
-`apps/inspect.md` is an observation task. `apps/pick_and_place.md` is an arm
-manipulation task; supply the arm ID and measured target flange poses through
-`--instruction`. Positions are in meters and orientations are unit quaternions
-in `[x, y, z, w]` order. Use coordinate frames listed in the configuration.
-Commands to two arms run sequentially; coordinated dual-arm trajectories are not
-supported. The ROS2 driver is responsible for coordinate transforms,
-calibration, and motion planning.
+`apps/inspect.md` is an observation task. `apps/pick_and_place.md` and
+`apps/dual_arm.md` use fixed-camera pixel detection, optional wrist refinement,
+coordinated pick/place, and wrist-image grasp verification. Describe the object
+and destination with `--instruction`; you do not need to supply Cartesian poses.
+Separate Gemini Robotics ER requests locate and refine pixel targets. The Live
+agent itself assesses grasp success from explicit post-pick camera images and
+arm state, then records its decision and reason with `verify_grasp`. Select its model
+with `--robotics-model` (default `gemini-robotics-er-2-preview`).
 
-The agent maps Gemini's `get_robot_state`, `move_arm`, `set_gripper`, and `stop`
-tool calls to HTTP requests and returns results and camera images to Gemini.
+ROS2 projects the pixels using registered depth, camera calibration and TF at
+the image acquisition time. A dual-arm plan moves both arms through coordinated
+phases in a single driver request per stage. The driver implements home poses,
+approach geometry, grasp orientation, motion planning and synchronized control.
+See [pixel workflow and driver contract](docs/pixel-workflow.md) for tools,
+prompts, required RGB-D/TF inputs and extension points. The
+[tool lifecycle guide](docs/tool-lifecycle.md) explains triggers, fault detection,
+controlled recovery/retries and external ER prompt files.
+
+The existing metric `move_arm`, `set_gripper`, and new `move_arms` tools remain
+available for measured/manual operations. They invalidate unfinished pixel plans.
 `finish_task` ends the application; a reported failure exits with status 1.
 An interrupted application, connection failure, or timeout triggers a stop
 request and connection cleanup. Motion requests are not automatically retried
@@ -73,8 +89,9 @@ python -m unittest discover -p '*_test.py' -v
 Agent unit tests mock HTTP and Gemini and require no ROS2 installation, API key,
 or hardware. See [server testing instructions](server/README.md#tests) for server
 unit and integration tests. Integration tests use real ROS2 topics, services,
-and HTTP, with Gemini and the robot driver mocked. Physical hardware, TF,
-collision checking, and the live Gemini API require separate validation.
+HTTP and capture-time TF, with Gemini and the robot driver mocked. Physical
+hardware, calibration accuracy, synchronized control, collision checking, and
+the live Gemini API require separate validation.
 
 ## License and attribution
 

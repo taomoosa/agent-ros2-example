@@ -23,6 +23,26 @@ python -m pip install -r requirements.txt
 python run_ros2.py --help
 ```
 
+For pixel-guided applications, see [the workflow guide](../docs/pixel-workflow.md).
+For example, after starting a server and compatible driver:
+
+```bash
+python run_ros2.py --config configs/dual_arm.json --model "$GEMINI_LIVE_MODEL" \
+  --robotics-model gemini-robotics-er-2-preview --task-file apps/dual_arm.md \
+  --instruction "Grasp the opposite ends of the red bar and move it onto the tray."
+```
+
+`--model` controls Live orchestration; `--robotics-model` controls the separate
+ER requests for detection and refinement. Grasp assessment belongs to the Live
+agent: `inspect_grasp` supplies original wrist images and arm state, then
+`verify_grasp` records its decisions. Both model connections use `GEMINI_API_KEY`. The ER client uses the existing `httpx` dependency.
+
+For a single fixed camera with one arm, use `configs/minimal.json`. Inspection
+falls back to that fixed camera. Customize detection with
+`--er-detect-prompt-file prompt_examples/grasp_guidance.md` and set the recovery
+budget with `--max-recovery-attempts` (default 2). See the
+[tool lifecycle guide](../docs/tool-lifecycle.md) for prerequisites and retry rules.
+
 ## Tests
 
 Run the tests from `agent/` with the virtual environment activated:

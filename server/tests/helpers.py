@@ -3,6 +3,7 @@
 import asyncio
 import io
 import json
+import struct
 from pathlib import Path
 import threading
 import time
@@ -17,7 +18,9 @@ from rclpy.qos import qos_profile_sensor_data
 from rclpy.signals import SignalHandlerOptions
 from rclpy.task import Future
 from ros2_agent_interfaces.srv import RobotRequest
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import CompressedImage, CameraInfo, Image as DepthImage
+from geometry_msgs.msg import TransformStamped
+from tf2_ros import TransformBroadcaster
 from std_msgs.msg import String
 
 from ros2_agent_server.gateway import HttpGatewayNode
@@ -60,6 +63,9 @@ class FakeDriver(Node):
         self.calls = []
         self.publish_images = True
         self.publish_states = True
+        self.publish_geometry = True
+        self.confirm_coordination = True
+        self.wrist_offset = 1.0
         self.hold_moves = False
         self.reply_status = 200
         self.reply_payload = {"success": True}
@@ -74,6 +80,13 @@ class FakeDriver(Node):
         self.image_publishers = {camera.id: self.create_publisher(
             CompressedImage, robot_config.camera_topic(camera.id), qos_profile_sensor_data)
             for camera in robot_config.cameras}
+        self.info_publishers = {c.id: self.create_publisher(CameraInfo,
+            f'{robot_config.server.namespace}/cameras/{c.id}/camera_info', qos_profile_sensor_data)
+            for c in robot_config.cameras}
+        self.depth_publishers = {c.id: self.create_publisher(DepthImage,
+            f'{robot_config.server.namespace}/cameras/{c.id}/depth/aligned', qos_profile_sensor_data)
+            for c in robot_config.cameras}
+        self.tf_broadcaster = TransformBroadcaster(self)
         self.images = {camera.id: jpeg("blue" if camera.arm_id else "red") for camera in robot_config.cameras}
         self._group = ReentrantCallbackGroup()
         self.service = self.create_service(RobotRequest, robot_config.server.driver_service,
@@ -91,6 +104,23 @@ class FakeDriver(Node):
                     message.header.frame_id = camera.optical_frame
                     message.header.stamp = self.get_clock().now().to_msg()
                     self.image_publishers[camera.id].publish(message)
+                    if self.publish_geometry:
+                        info = CameraInfo(header=message.header, width=48, height=32,
+                            k=[100.,0.,24.,0.,100.,16.,0.,0.,1.])
+                        depth = DepthImage(header=message.header, width=48, height=32,
+                            encoding='16UC1', step=96, data=struct.pack('<H', 1000)*48*32)
+                        self.info_publishers[camera.id].publish(info)
+                        self.depth_publishers[camera.id].publish(depth)
+                        tf = TransformStamped()
+                        tf.header.stamp = message.header.stamp
+                        tf.header.frame_id = self.config.world_frame
+                        tf.child_frame_id = camera.optical_frame
+                        tf.transform.rotation.w = 1.
+                        tf.transform.translation.x = self.wrist_offset if camera.arm_id else 0.
+                        self.tf_broadcaster.sendTransform(tf)
+                        if camera.arm_id:
+                            tf.child_frame_id = camera.parent_frame
+                            self.tf_broadcaster.sendTransform(tf)
 
     async def serve(self, request, response):
         with self._lock:
@@ -111,7 +141,7 @@ class FakeDriver(Node):
             if request.operation == "stop":
                 self.release(False)
                 return Reply(payload={"success": True}).to_ros(response)
-            if request.operation == "move_arm" and self.hold_moves:
+            if request.operation in {"move_arm", "execute_plan", "move_arms", "reset_arms", "recover_arms"} and self.hold_moves:
                 future = Future(executor=self.executor)
                 self.held.append(future)
             else:
@@ -126,7 +156,22 @@ class FakeDriver(Node):
                         key: payload[key] for key in ("frame_id", "position", "orientation")}
                 if request.operation == "set_gripper":
                     self.states[request.resource_id]["gripper"] = payload
-        return Reply(status=self.reply_status, payload=self.reply_payload).to_ros(response)
+        if request.operation == 'execute_plan' and self.reply_status == 200 and self.reply_payload.get('success'):
+            for target in payload['targets']:
+                gripper = self.states[target['arm_id']]['gripper']
+                if payload['stage'] in {'pick', 'place'}:
+                    gripper['object_detected'] = payload['stage'] == 'pick'
+            self.publish()
+        if request.operation == 'recover_arms' and self.reply_status == 200 and self.reply_payload.get('success'):
+            for state in self.states.values():
+                state['fault'] = None
+                state['gripper'] = {'opening': 1.0, 'fault': None, 'object_detected': False}
+            self.publish()
+        result = dict(self.reply_payload)
+        if payload.get('coordinated') and self.confirm_coordination:
+            result.update(coordinated=True, completed_arm_ids=payload.get('arm_ids',
+                [t['arm_id'] for t in payload.get('targets', [])]))
+        return Reply(status=self.reply_status, payload=result).to_ros(response)
 
     def release(self, success=True):
         with self._lock:

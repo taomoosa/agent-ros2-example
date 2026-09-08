@@ -1,0 +1,19 @@
+{
+  "robot_url": "http://localhost:8080",
+  "world_frame": "world",
+  "arms": [
+    {
+      "id": "arm",
+      "base_frame": "arm_base",
+      "flange_frame": "arm_flange"
+    }
+  ],
+  "cameras": [
+    {
+      "id": "overhead",
+      "optical_frame": "overhead_optical",
+      "mount": "world",
+      "parent_frame": "world"
+    }
+  ]
+}

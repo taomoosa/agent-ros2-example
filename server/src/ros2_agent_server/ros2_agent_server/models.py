@@ -36,10 +36,22 @@ class Stop(Model):
     arm_id: str | None = None
 
 
+class Fault(Model):
+    code: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+    recoverable: bool = False
+
+
+class GripperState(Gripper):
+    fault: Fault | None = None
+    object_detected: bool | None = None
+
+
 class ArmState(Model):
     moving: bool
     flange_pose: Pose
-    gripper: Gripper
+    gripper: GripperState
+    fault: Fault | None = None
 
 
 class Arm(Model):

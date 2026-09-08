@@ -5,6 +5,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 
 from .models import MoveArm, Gripper, Stop
+from .workflow import DetectPlan, RefinePlan, ExecutePlan, VerifyPlan, MoveArms
 from .protocol import BridgeError, validate_request
 
 
@@ -35,7 +36,8 @@ def create_app(gateway, config):
                 "X-Frame-Id": result.payload["frame_id"],
                 "X-Stamp-Ns": str(result.payload["stamp_ns"]),
             })
-        return JSONResponse(result.payload, status_code=result.status)
+        return JSONResponse(result.payload, status_code=result.status,
+                            headers={"Cache-Control": "no-store"} if operation == "capture" else None)
 
     @app.get("/v1/state")
     async def state():
@@ -56,5 +58,37 @@ def create_app(gateway, config):
     @app.post("/v1/stop")
     async def stop(body: Stop):
         return await request("stop", payload=body.model_dump())
+
+    @app.get("/v1/cameras/{camera_id}/capture")
+    async def capture(camera_id: str):
+        return await request("capture", camera_id, timeout=config.server.camera_timeout)
+
+    @app.post("/v1/plans")
+    async def create_plan(body: DetectPlan):
+        return await request("create_plan", payload=body.model_dump())
+
+    @app.post("/v1/plans/refine")
+    async def refine_plan(body: RefinePlan):
+        return await request("refine_plan", payload=body.model_dump())
+
+    @app.post("/v1/plans/execute")
+    async def execute_plan(body: ExecutePlan):
+        return await request("execute_plan", payload=body.model_dump(), timeout=60.0)
+
+    @app.post("/v1/plans/verify")
+    async def verify_plan(body: VerifyPlan):
+        return await request("verify_grasp", payload=body.model_dump())
+
+    @app.post("/v1/arms/reset")
+    async def reset_arms():
+        return await request("reset_arms", timeout=60.0)
+
+    @app.post("/v1/arms/recover")
+    async def recover_arms():
+        return await request("recover_arms", timeout=60.0)
+
+    @app.post("/v1/arms/poses")
+    async def move_arms(body: MoveArms):
+        return await request("move_arms", payload=body.model_dump(), timeout=60.0)
 
     return app

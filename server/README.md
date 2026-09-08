@@ -20,12 +20,20 @@ callbacks and stop requests to run while a capture or command is pending.
 Both nodes run in one process by default; `--role` can separate them into two
 processes.
 
+For your first hardware installation, follow the
+[integration guide](docs/integration.md): it identifies the configuration,
+telemetry/camera adapters and driver operations you must supply, with a minimal
+configuration and bring-up checks. When adding a capability, use the
+[extension guide](docs/extending.md) for the exact server/agent files to change,
+validation and motion lifecycle requirements, and tests to extend.
+
 ## Setup and startup
 
 The reference environment is Ubuntu 24.04, ROS2 Jazzy, and Python 3.12.
 Install ROS2 at the OS level; `rclpy` does not need to be installed with pip.
 Building requires colcon, ament_cmake, ament_python,
-rosidl_default_generators, sensor_msgs, and std_msgs.
+rosidl_default_generators, sensor_msgs, std_msgs, and tf2_ros. The integration
+tests also use geometry_msgs and TF broadcasters.
 
 Run from the repository root:
 
@@ -47,7 +55,7 @@ HTTP listens on `127.0.0.1:8080` by default. Interactive API documentation is
 available at `/docs`. To connect an agent from another host, configure `--host`
 and the agent's `robot_url`.
 
-`--config` accepts the included single-arm or dual-arm configuration, or an agent
+`--config` accepts the included minimal, single-arm or dual-arm configuration, or an agent
 configuration in the same format. The server accepts `robot_url` for
 compatibility, but its listen address is determined by `--host` and `--port`.
 
@@ -79,6 +87,9 @@ letters, digits, and underscores, starting with a letter or underscore.
 |---|---|---|
 | Subscribe to `/robotics/arms/{arm_id}/state` | `std_msgs/msg/String` | Arm state JSON shown below |
 | Subscribe to `/robotics/cameras/{camera_id}/image/compressed` | `sensor_msgs/msg/CompressedImage` | JPEG, optical frame, and acquisition timestamp |
+| Subscribe to `/robotics/cameras/{camera_id}/camera_info` | `sensor_msgs/msg/CameraInfo` | Rectified calibration matching the JPEG geometry |
+| Subscribe to `/robotics/cameras/{camera_id}/depth/aligned` | `sensor_msgs/msg/Image` | Measured depth aligned to RGB with the same acquisition timestamp |
+| Listen to `/tf` and `/tf_static` | TF messages | Camera-to-world and, for wrist cameras, flange-to-world transforms at acquisition time |
 | Serve `/robotics/request` | `ros2_agent_interfaces/srv/RobotRequest` | State, image, and command requests from the HTTP gateway |
 | Call `/robot_driver/execute` | `ros2_agent_interfaces/srv/RobotRequest` | Commands for a hardware-specific driver |
 
@@ -97,6 +108,8 @@ at regular intervals:
 }
 ```
 
+The HTTP gateway client and bridge service use reliable, volatile service QoS
+with history depth 64 to accommodate concurrent image-request bursts.
 State subscriptions use reliable QoS with depth 1. Image subscriptions use
 sensor-data QoS with best-effort reliability. `/v1/state` returns 503 if any arm
 has no state or its last update was received more than `state_max_age` seconds
@@ -120,9 +133,9 @@ request and response type.
 
 | Request field | Meaning |
 |---|---|
-| `operation` | `state`, `camera`, `move_arm`, `set_gripper`, or `stop` |
-| `resource_id` | Camera ID for camera requests; arm ID for move/gripper requests; empty for state/stop |
-| `payload_json` | JSON object matching the HTTP body; `{}` for state/camera |
+| `operation` | `state`, `camera`, `capture`, `move_arm`, `set_gripper`, `stop`, `create_plan`, `refine_plan`, `execute_plan`, `verify_grasp`, `reset_arms`, `move_arms`, `recover_arms` |
+| `resource_id` | Camera ID for camera/capture requests; arm ID for move/gripper requests; empty for state, stop and workflow operations |
+| `payload_json` | Gateway-to-bridge: validated HTTP fields. Bridge-to-driver: command payload, enriched with targets/phases/arm IDs as applicable; see the [driver operation map](docs/integration.md#3-implement-the-hardware-driver-adapter) |
 | `timeout_sec` | Response deadline in seconds, greater than 0 and at most 65 |
 
 | Response field | Meaning |
@@ -132,21 +145,33 @@ request and response type.
 | `data` | JPEG bytes; empty for ordinary command responses |
 | `content_type` | `application/json` or `image/jpeg` |
 
-Drivers handle `move_arm`, `set_gripper`, and `stop`. The stop target is the
+Drivers handle `move_arm`, `set_gripper`, `stop`, `reset_arms`, `move_arms`,
+`recover_arms`, and `execute_plan`. See the [pixel workflow](../docs/pixel-workflow.md) for
+additional camera_info/aligned-depth/TF subscriptions, capture and plan payloads,
+and mandatory group synchronization/completion semantics. The stop target is the
 `arm_id` field in `payload_json`; null means all arms.
 
-Return `status_code=200` and `{"success": true}` **after the command completes**.
+For `move_arm`, `set_gripper` and `stop`, return `status_code=200` and
+`{"success": true}` **after the command completes**. Group operations
+(`reset_arms`, `move_arms`, `execute_plan`, `recover_arms`) additionally require
+`"coordinated": true` and `"completed_arm_ids"` listing every requested arm
+exactly once, even for a single arm.
 Report failure with `{"success": false, "error": "..."}` or a 4xx/5xx status.
 Responses that indicate acceptance without completion, such as 202, are
 converted to 502. Timeouts return 504 with `outcome: "unknown"`. Requests are not
 automatically retried. Cancelling a service wait does not stop physical motion;
 the driver must handle stop requests separately.
 
-Hardware-specific MoveIt, action, controller, and TF integrations are not
-included. The driver is responsible for transforming flange targets, planning,
+Hardware-specific MoveIt, action, and controller integrations are not
+included. Capture-time TF lookup and RGB-D projection are implemented by the bridge. The driver is responsible for transforming flange targets, planning,
 collision checks, speed and force limits, and stopping active motion. Commands
 return 503 when no driver service is connected. The test driver in
 `tests/helpers.py` is not used by the runtime nodes.
+
+The [tool lifecycle guide](../docs/tool-lifecycle.md) defines recovery after
+failed motion, optional arm/gripper faults and object-detection telemetry, and
+the one-fixed-camera configuration `configs/minimal.json`. Recovery is a
+separate coordinated driver operation; returning home alone is not recovery.
 
 ## Tests
 
@@ -168,7 +193,9 @@ with Gemini and the hardware-specific driver mocked. The dual-arm test uses ASGI
 HTTP integration; the single-arm test runs the agent against Uvicorn over a real
 TCP connection. Tests also cover command completion, stop during motion,
 concurrent image requests, failures, timeouts, and CLI startup and shutdown.
-No hardware or Gemini API key is required.
+Pixel workflow tests additionally cover RGB-D projection, capture-time wrist TF,
+ER detection/refinement, Live-agent grasp assessment, and two complete coordinated manipulation
+cycles through the Live agent and server. No hardware or Gemini API key is required.
 
 The asynchronous design follows the [ROS2 callback group documentation](https://docs.ros.org/en/jazzy/How-To-Guides/Using-callback-groups.html).
 HTTP unit tests follow the [FastAPI async testing documentation](https://fastapi.tiangolo.com/advanced/async-tests/).

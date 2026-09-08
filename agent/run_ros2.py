@@ -10,18 +10,23 @@ from pathlib import Path
 
 from embodiment.ros2.config import RobotConfig
 from embodiment.ros2.ros2_embodiment import Ros2Embodiment
-from session_manager import SessionManager
+from embodiment.ros2.live_session import Ros2SessionManager
+from embodiment.ros2.robotics_er import DEFAULT_ROBOTICS_MODEL
 
 
 async def run_application(config: RobotConfig, instruction: str, *, model: str,
                           api_key: str, response_modality: str = "AUDIO",
                           timeout: float = 180.0, transport=None,
-                          session_factory=SessionManager, on_event=None):
+                          session_factory=Ros2SessionManager, on_event=None,
+                          robotics_model=DEFAULT_ROBOTICS_MODEL, robotics_transport=None,
+                          er_prompt_files=None, max_recovery_attempts=2):
   if not instruction.strip():
     raise ValueError("An application instruction is required")
   if timeout <= 0:
     raise ValueError("timeout must be positive")
-  embodiment = Ros2Embodiment(config, transport=transport)
+  embodiment = Ros2Embodiment(config, transport=transport, api_key=api_key,
+      robotics_model=robotics_model, robotics_transport=robotics_transport,
+      er_prompt_files=er_prompt_files, max_recovery_attempts=max_recovery_attempts)
   session = None
 
   async def consume():
@@ -78,7 +83,11 @@ def main():
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--config", required=True, help="Robot topology JSON file")
   parser.add_argument("--model", required=True, help="Gemini Live model available to your API key")
-  parser.add_argument("--instruction", default="", help="Task and calibrated target poses")
+  parser.add_argument("--robotics-model", default=DEFAULT_ROBOTICS_MODEL, help="Separate Robotics ER image reasoning model")
+  parser.add_argument("--er-detect-prompt-file", type=Path, help="UTF-8 application guidance appended to the ER detection prompt")
+  parser.add_argument("--er-refine-prompt-file", type=Path, help="UTF-8 application guidance appended to the ER refinement prompt")
+  parser.add_argument("--max-recovery-attempts", type=int, default=2, choices=range(11), help="Explicit recovery attempts per application (default 2)")
+  parser.add_argument("--instruction", default="", help="Task instructions, including object and destination descriptions")
   parser.add_argument("--task-file", type=Path, help="Application instructions in a UTF-8 file")
   parser.add_argument("--response-modality", choices=("AUDIO", "TEXT"), default="AUDIO")
   parser.add_argument("--timeout", type=float, default=180.0, help="Application time limit in seconds")
@@ -101,7 +110,10 @@ def main():
     result = asyncio.run(run_application(
         RobotConfig.load(args.config), instruction, model=args.model,
         api_key=api_key, response_modality=args.response_modality,
-        timeout=args.timeout, on_event=print_event,
+        timeout=args.timeout, on_event=print_event, robotics_model=args.robotics_model,
+        max_recovery_attempts=args.max_recovery_attempts,
+        er_prompt_files={mode: path for mode, path in (
+            ('detect', args.er_detect_prompt_file), ('refine', args.er_refine_prompt_file)) if path is not None},
     ))
   except KeyboardInterrupt:
     raise SystemExit(130)

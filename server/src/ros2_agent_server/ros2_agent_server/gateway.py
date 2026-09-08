@@ -8,13 +8,15 @@ from rclpy.node import Node
 from ros2_agent_interfaces.srv import RobotRequest
 
 from .protocol import BridgeError, Reply
+from .qos import http_service_qos
 
 
 class HttpGatewayNode(Node):
     def __init__(self, config, **kwargs):
         super().__init__("http_gateway", **kwargs)
         self.client = self.create_client(
-            RobotRequest, config.request_service, callback_group=ReentrantCallbackGroup())
+            RobotRequest, config.request_service, callback_group=ReentrantCallbackGroup(),
+            qos_profile=http_service_qos())
 
     async def request(self, operation, resource_id, payload, timeout):
         if not self.client.service_is_ready():

@@ -91,5 +91,28 @@ class Ros2RobotClient:
       image.verify()
     return response.content
 
+  async def capture(self, camera_id):
+    if camera_id not in {c.id for c in self.config.cameras}:
+      raise ValueError('Unknown camera')
+    result = await self._request('GET', f'/v1/cameras/{camera_id}/capture')
+    if (not {'capture_id', 'camera_id', 'width', 'height', 'image_base64'} <= result.keys()
+        or any(type(result[k]) is not int or result[k] <= 0 for k in ('width', 'height'))):
+      raise ValueError('Invalid capture metadata')
+    import base64
+    data = base64.b64decode(result['image_base64'], validate=True)
+    with Image.open(io.BytesIO(data)) as image:
+      if image.format != 'JPEG' or image.size != (result['width'], result['height']):
+        raise ValueError('Capture image dimensions do not match metadata')
+      image.verify()
+    if result['camera_id'] != camera_id or not isinstance(result['capture_id'], str):
+      raise ValueError('Invalid capture identity')
+    return result
+
+  async def workflow(self, operation, **payload):
+    paths = {'recover': '/v1/arms/recover', 'reset': '/v1/arms/reset', 'create': '/v1/plans',
+             'refine': '/v1/plans/refine', 'execute': '/v1/plans/execute',
+             'verify': '/v1/plans/verify', 'move_arms': '/v1/arms/poses'}
+    return await self._request('POST', paths[operation], json=payload, timeout=65.)
+
   async def close(self):
     await self._client.aclose()

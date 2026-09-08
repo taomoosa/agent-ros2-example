@@ -55,8 +55,14 @@ def validate_request(config, operation, resource_id, payload):
     cameras = {camera.id for camera in config.cameras}
     if operation in {"move_arm", "set_gripper"} and resource_id not in arms:
         raise BridgeError(404, f"Unknown arm: {resource_id}")
-    if operation == "camera" and resource_id not in cameras:
+    if operation in {"camera", "capture"} and resource_id not in cameras:
         raise BridgeError(404, f"Unknown camera: {resource_id}")
+    from .workflow import BODIES, validate_workflow
+    if operation in BODIES or operation in {'reset_arms', 'recover_arms'}:
+        try:
+            return validate_workflow(config, operation, resource_id, payload)
+        except ValueError as exc:
+            raise BridgeError(422, str(exc)) from exc
     try:
         if operation == "move_arm":
             body = MoveArm.model_validate(payload)
@@ -72,7 +78,7 @@ def validate_request(config, operation, resource_id, payload):
             if resource_id:
                 raise BridgeError(422, "stop uses payload.arm_id, not resource_id")
             return body.model_dump()
-        if operation in {"state", "camera"}:
+        if operation in {"state", "camera", "capture"}:
             if payload or (operation == "state" and resource_id):
                 raise BridgeError(422, "Unexpected request fields")
             return payload

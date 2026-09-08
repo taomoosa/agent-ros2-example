@@ -47,7 +47,8 @@ class RosIntegrationTest(unittest.IsolatedAsyncioTestCase):
         responses = await asyncio.wait_for(asyncio.gather(*[
             self.http.get("/v1/cameras/overhead/image") for _ in range(12)
         ]), timeout=5)
-        self.assertTrue(all(response.status_code == 200 for response in responses))
+        self.assertTrue(all(response.status_code == 200 for response in responses),
+                        [(r.status_code, r.text if r.status_code != 200 else "JPEG") for r in responses])
 
     async def test_camera_timeout_returns_no_cached_image(self):
         self.fixture.driver.publish_images = False
@@ -77,8 +78,11 @@ class RosIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.fixture.driver.reply_payload = {"success": False, "error": "Unreachable"}
         response = await self.http.post("/v1/arms/right/gripper", json={"opening": 0.5})
         self.assertEqual(409, response.status_code)
-        self.fixture.driver.reply_status = 202
+        self.fixture.driver.reply_status = 200
         self.fixture.driver.reply_payload = {"success": True}
+        await self.http.post('/v1/stop', json={})
+        self.assertTrue((await self.http.post('/v1/arms/recover')).json()['success'])
+        self.fixture.driver.reply_status = 202
         response = await self.http.post("/v1/arms/right/gripper", json={"opening": 0.5})
         self.assertEqual(502, response.status_code)
         self.assertEqual("unknown", response.json()["outcome"])
