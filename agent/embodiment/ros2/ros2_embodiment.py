@@ -16,6 +16,10 @@ from embodiment.ros2.robotics_er import RoboticsER, DEFAULT_ROBOTICS_MODEL
 from embodiment.ros2.manipulation import Manipulation
 
 
+MOTION_TOOLS = frozenset({'move_arm', 'set_gripper', 'move_arms', 'reset_arms',
+                          'recover_arms', 'approach_targets', 'pick_targets', 'place_targets'})
+
+
 class Ros2Embodiment(base.Embodiment):
   def __init__(self, config: RobotConfig, *, transport=None, api_key="",
                robotics_model=DEFAULT_ROBOTICS_MODEL, robotics_transport=None,
@@ -35,6 +39,11 @@ class Ros2Embodiment(base.Embodiment):
     self.poller_task = None
     self.task_result = None
     self._action_lock = asyncio.Lock()
+    self._stop_generation = 0
+    self._motion_active = False
+    self.session_lost = False
+    self.observation_revision = 0
+    self.scene_revision = None
 
   async def initialize(self):
     if self.poller_task is not None:
@@ -62,15 +71,44 @@ class Ros2Embodiment(base.Embodiment):
     topology.pop("robot_url")
     return prompt + "\nRobot topology:\n" + json.dumps(topology, ensure_ascii=False)
 
+  def interrupt(self, *, session_lost=False):
+    self._stop_generation += 1
+    self.session_lost |= session_lost
+    self.manipulation.needs_recovery |= self._motion_active or session_lost or any(
+        p['state'] in {'picked', 'verified'} for p in self.manipulation.plans.values())
+    self.manipulation.invalidate()
+
   async def execute_action(self, action_name: str, **kwargs):
-    # The upstream event bus may dispatch distinct tool-call events concurrently.
-    # Stop must remain available while a motion HTTP request is pending.
-    if action_name == "stop":
+    # Calls queued before a stop cannot run after it releases the action lock.
+    generation = self._stop_generation
+    if action_name == 'stop':
+      self.interrupt()
       return await self._execute_action(action_name, **kwargs)
     async with self._action_lock:
-      if self.task_result is not None:
-        return {"success": False, "error": "The application has already finished"}
-      return await self._execute_action(action_name, **kwargs)
+      if self.task_result is not None or self.session_lost or generation != self._stop_generation:
+        return {'success': False, 'error': 'Application finished or operation interrupted'}
+      self._motion_active = action_name in MOTION_TOOLS
+      if self._motion_active:
+        self.observation_revision += 1
+      try:
+        result = await self._execute_action(action_name, **kwargs)
+        if generation != self._stop_generation:
+          self.manipulation.invalidate()
+          if action_name == 'finish_task':
+            self.task_result = None
+          return {'success': False, 'error': 'Operation interrupted; old result discarded',
+                  'outcome': 'unknown' if self._motion_active else 'interrupted',
+                  'next_actions': ['get_robot_state', 'recover_arms', 'finish_task']}
+        return result
+      except (ValueError, TypeError) as exc:
+        return {'success': False, 'error': str(exc)}
+      except asyncio.CancelledError:
+        if self._motion_active:
+          self.manipulation.needs_recovery = True
+          self.manipulation.invalidate()
+        raise
+      finally:
+        self._motion_active = False
 
   async def _execute_action(self, action_name: str, **kwargs):
     if action_name == "ack" and not kwargs:
@@ -84,6 +122,21 @@ class Ros2Embodiment(base.Embodiment):
           p['state'] in {'picked', 'verified', 'invalid'} for p in self.manipulation.plans.values())):
         return {'success': False, 'error': 'Cannot finish successfully with held objects or unresolved failures',
                 'next_actions': ['get_robot_state', 'recover_arms', 'finish_task']}
+      if kwargs['success'] and (self.manipulation.final_observation_required or
+                                self.scene_revision != self.observation_revision):
+        return {'success': False, 'error': 'Observe current state and scene with get_robot_state before finishing',
+                'next_actions': ['get_robot_state', 'finish_task']}
+      if kwargs['success']:
+        try:
+          state = await self.robot.get_robot_state()
+        except (httpx.HTTPError, ValueError) as exc:
+          return {'success': False, 'error': f'Final state unavailable: {exc}',
+                  'next_actions': ['get_robot_state', 'finish_task']}
+        if (state.get('success') is False or state.get('recovery_required') or state.get('motion_outcome_unknown') or any(
+            a.get('moving') is True or a.get('fault') or a.get('gripper', {}).get('fault') or
+            a.get('gripper', {}).get('object_detected') is True for a in state.get('arms', []))):
+          return {'success': False, 'error': 'Final state reports motion, a fault, or a held object',
+                  'next_actions': ['get_robot_state', 'recover_arms', 'finish_task']}
       self.task_result = dict(kwargs)
       return self.task_result
     actions = {
@@ -103,15 +156,22 @@ class Ros2Embodiment(base.Embodiment):
       if action_name in {'stop', 'move_arm', 'set_gripper'}:
         if any(p['state'] in {'picked', 'verified'} for p in self.manipulation.plans.values()):
           self.manipulation.needs_recovery = True
+          self.manipulation.invalidate()
+          if action_name != 'stop':
+            raise ValueError('Manual motion cannot discard a held-object plan; stop and recover')
         self.manipulation.invalidate()
+      observation_revision = self.observation_revision
       result = await actions[action_name](**kwargs)
       if action_name == 'get_robot_state':
-        self.manipulation.needs_recovery |= result.get('recovery_required') is True
+        result['observation_revision'] = observation_revision
+        self.manipulation.needs_recovery |= (result.get('recovery_required') is True or
+                                            result.get('motion_outcome_unknown') is True or any(
+            a.get('fault') or a.get('gripper', {}).get('fault') for a in result.get('arms', [])))
         result['manipulation'] = dict(
             plans=[dict(plan_id=k, state=v['state']) for k, v in self.manipulation.plans.items()],
             recovery_required=self.manipulation.needs_recovery,
             recovery_attempts_remaining=self.manipulation.max_recovery_attempts-self.manipulation.recovery_attempts)
-      if action_name in {'move_arm', 'set_gripper', 'move_arms', 'reset_arms'} and result.get('success') is not True:
+      if action_name in MOTION_TOOLS | {'stop'} and result.get('success') is not True:
         self.manipulation.needs_recovery = True
       return result
     except (ValueError, TypeError) as exc:
@@ -125,14 +185,13 @@ class Ros2Embodiment(base.Embodiment):
         detail = {}
       result = dict(detail, success=False, http_status=exc.response.status_code)
       result.setdefault('error', str(exc))
-      if action_name in {'move_arm', 'set_gripper', 'move_arms', 'reset_arms', 'recover_arms',
-                          'approach_targets', 'pick_targets', 'place_targets'}:
+      if action_name in MOTION_TOOLS | {'stop', 'verify_grasp'}:
         self.manipulation.needs_recovery = True
         result['next_actions'] = (['stop', 'finish_task'] if result.get('recoverable') is False
                                   else ['get_robot_state', 'recover_arms', 'finish_task'])
       return result
     except httpx.HTTPError as exc:
-      if action_name in {'move_arm', 'set_gripper', 'move_arms', 'reset_arms', 'recover_arms'}:
+      if action_name in MOTION_TOOLS | {'stop', 'verify_grasp'}:
         self.manipulation.needs_recovery = True
       if action_name in {'get_robot_state', 'detect_targets', 'refine_grasp', 'inspect_grasp'}:
         return {'error': str(exc), 'success': False, 'motion_started': False,

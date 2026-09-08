@@ -218,6 +218,7 @@ class ApplicationTest(unittest.IsolatedAsyncioTestCase):
                 "arm_id": arm, "frame_id": "world", "position": [0.1, 0, 0.3],
                 "orientation": [0, 0, 0, 1]}},
             {"id": "grip-1", "name": "set_gripper", "args": {"arm_id": arm, "opening": 0}},
+            {"id": "state-final", "name": "get_robot_state", "args": {}},
             {"id": "done-1", "name": "finish_task", "args": {"success": True, "summary": "Done"}},
         ]
         stream = MockGeminiStream(backend.history, calls)
@@ -235,7 +236,7 @@ class ApplicationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([a.id for a in config.arms],
             declarations["move_arm"]["parameters"]["properties"]["arm_id"]["enum"])
         responses = [m["toolResponse"]["functionResponses"][0] for m in stream.messages if "toolResponse" in m]
-        self.assertEqual(["move-1", "grip-1", "done-1"], [r["id"] for r in responses])
+        self.assertEqual(["move-1", "grip-1", "state-final", "done-1"], [r["id"] for r in responses])
         move_index = backend.history.index(("http", "POST", f"/v1/arms/{arm}/pose"))
         response_index = next(i for i, entry in enumerate(backend.history)
             if entry[0] == "gemini" and "toolResponse" in entry[1])
@@ -328,20 +329,21 @@ class ApplicationTest(unittest.IsolatedAsyncioTestCase):
     finally:
       release.set()
       await asyncio.gather(first, second)
-    self.assertEqual(["/v1/arms/left/pose", "/v1/arms/right/pose"], moves)
-    await embodiment.execute_action("finish_task", success=True, summary="Done")
+    self.assertEqual(["/v1/arms/left/pose"], moves)
+    self.assertFalse(first.result()['success'])
+    self.assertFalse(second.result()['success'])
+    self.assertFalse((await embodiment.execute_action("finish_task", success=True, summary="Done"))['success'])
+    await embodiment.execute_action("finish_task", success=False, summary="Stopped; recovery required")
     result = await embodiment.execute_action("move_arm", arm_id="left", **args)
     self.assertFalse(result["success"])
-    self.assertEqual(2, len(moves))
+    self.assertEqual(1, len(moves))
 
   async def test_unknown_tool_and_resource_cleanup(self):
     config = RobotConfig.load(CONFIGS / "single_arm.json")
     embodiment = Ros2Embodiment(config, transport=httpx.MockTransport(MockRobot()))
     await embodiment.initialize()
-    with self.assertRaises(ValueError):
-      await embodiment.execute_action("navigate", name="spot-only")
-    with self.assertRaises(ValueError):
-      await embodiment.execute_action("finish_task", success="yes", summary="Done")
+    self.assertFalse((await embodiment.execute_action("navigate", name="spot-only"))['success'])
+    self.assertFalse((await embodiment.execute_action("finish_task", success="yes", summary="Done"))['success'])
     await embodiment.close()
     await embodiment.close()
     self.assertTrue(embodiment.robot._client.is_closed)

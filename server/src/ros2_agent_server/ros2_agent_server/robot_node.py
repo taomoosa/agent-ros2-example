@@ -255,12 +255,19 @@ class RobotBridgeNode(Node):
             self._recovery_required = self._recovery_required or self._motion_busy or any(
                 p['state'] in {'picked', 'verified', 'executing'} for p in self.pixels.plans.values())
             self.pixels.invalidate()
-            self._motion_uncertain = self._motion_uncertain or self._motion_busy
+            was_uncertain = self._motion_uncertain or self._motion_busy
+            self._motion_uncertain = True
+            self._all_stopped = False
+            generation = self._generation
             reply = await self._command(operation, resource_id, payload, timeout)
+            if generation != self._generation:
+                return Reply.from_error(BridgeError(409, 'Stop superseded by another stop', outcome='unknown'))
             if reply.status == 200 and reply.payload.get('success') is True:
                 if payload.get('arm_id') is None:
                     self._motion_uncertain = False
                     self._all_stopped = True
+                else:
+                    self._motion_uncertain = was_uncertain
             else:
                 self._motion_uncertain = True
             return reply
@@ -307,6 +314,11 @@ class RobotBridgeNode(Node):
             if operation == 'recover_arms' and not self._all_stopped:
                 raise BridgeError(409, 'Stop all arms successfully before recovery')
             self._check_health(arm_ids, recovering=operation == 'recover_arms')
+            if operation != 'recover_arms' and any(
+                    p['state'] in {'picked', 'verified'} for p in self.pixels.plans.values()):
+                self._recovery_required = True
+                self.pixels.invalidate()
+                raise BridgeError(409, 'Manual motion cannot discard a held-object plan; stop and recover')
             self.pixels.invalidate()
             if grouped:
                 payload = dict(payload, arm_ids=arm_ids, coordinated=True)
@@ -328,8 +340,9 @@ class RobotBridgeNode(Node):
                         or sorted(completed) != sorted(arm_ids)):
                     self._motion_uncertain = True
                     return Reply.from_error(BridgeError(502, 'Driver did not confirm coordinated completion for every arm', outcome='unknown'))
-            if reply.status == 200 and reply.payload.get('success') is True and operation != 'recover_arms':
-                self._check_health(arm_ids)
+            if reply.status == 200 and reply.payload.get('success') is True:
+                self._check_health(arm_ids, expect_released=(operation == 'recover_arms' or
+                    operation == 'execute_plan' and payload['stage'] == 'place'))
             completed_successfully = reply.status == 200 and reply.payload.get('success') is True
             if operation == 'recover_arms' and completed_successfully:
                 self._recovery_required = False
@@ -346,18 +359,24 @@ class RobotBridgeNode(Node):
             if plan is not None and plan['state'] == 'executing':
                 plan['state'] = 'invalid'
 
-    def _check_health(self, arm_ids, *, recovering=False, expect_grasp=False):
+    def _check_health(self, arm_ids, *, recovering=False, expect_grasp=False, expect_released=False):
         state = self.store.state(self.get_clock().now().nanoseconds)
         failures = []
         for arm in state['arms']:
             if arm['id'] not in arm_ids:
                 continue
+            if arm['moving']:
+                failures.append(dict(arm_id=arm['id'], component='arm', code='arm_moving',
+                                     message='Arm state still reports motion', recoverable=True))
             for component, fault in [('arm', arm.get('fault')), ('gripper', arm['gripper'].get('fault'))]:
                 if fault and (not recovering or not fault['recoverable']):
                     failures.append(dict(arm_id=arm['id'], component=component, **fault))
             if expect_grasp and arm['gripper'].get('object_detected') is False:
                 failures.append(dict(arm_id=arm['id'], component='gripper', code='no_object',
                                      message='Gripper reports no held object', recoverable=True))
+            if expect_released and arm['gripper'].get('object_detected') is True:
+                failures.append(dict(arm_id=arm['id'], component='gripper', code='object_not_released',
+                                     message='Gripper still reports a held object', recoverable=True))
         if failures:
             self._recovery_required = True
             self.pixels.invalidate()

@@ -70,3 +70,9 @@ pixel plans instead retain world points transformed at image acquisition time.
 
 See [tool lifecycle and recovery](tool-lifecycle.md) for optional fault/object
 telemetry, failure response details and the explicit recovery driver operation.
+
+`POST /v1/arms/reset` and `/v1/arms/recover` accept an omitted body or `{}`.
+Unknown fields, JSON null, arrays/scalars and malformed JSON return 422 before
+any driver call. Both HTTP and direct ROS requests use the same validation.
+See [tool outcomes](tool-results.md) for final observation and stop/recovery
+semantics; a successful physical stage is distinct from task achievement.

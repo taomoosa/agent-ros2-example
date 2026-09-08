@@ -142,3 +142,15 @@ Use these files for contact-point preferences, object-specific constraints and
 visibility criteria. The built-in JSON keys and normalized `[y,x]` coordinate
 contract stay in the request; model output is still strictly validated. The tool's
 `instruction` adds the particular object/destination request for each call.
+
+## Completion evidence and interruption
+
+See [tool outcomes and scenario coverage](tool-results.md) for the complete
+per-tool result/evidence table and regression mapping. Manual motion and reset
+cannot discard a held-object plan; stop and recover first. Successful finish
+requires a delivered `get_robot_state` scene observation after the latest motion
+attempt and a new final state check. After placement, inspect the destination
+before detecting again; stage completion alone does not prove task achievement.
+Missing final imagery must lead to another observation or failure, not another
+execution of the completed placement. Gemini disconnection or duplicate tool
+call IDs terminate the application and trigger stop instead of automatic replay.

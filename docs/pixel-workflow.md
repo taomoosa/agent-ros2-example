@@ -138,10 +138,12 @@ For example, after inspecting both arms, the Live agent may call:
 }
 ```
 
-This assessment leaves the plan in `picked` and blocks placement. Gripper opening
-is currently the available gripper telemetry; a closed gripper alone is not
-proof of grasp. No force/contact sensor inference is fabricated. Use a new
-inspection or stop when the evidence is insufficient.
+This assessment leaves the plan in `picked` and blocks placement. Gripper
+telemetry includes `opening` and optional `fault` / `object_detected` fields.
+Opening-only messages remain valid. Closed jaws or null/missing sensor readings
+are not proof of grasp; `object_detected: false` blocks a positive visual
+assessment and placement. No force/contact sensor inference is fabricated.
+Use a new inspection or stop when the evidence is insufficient.
 
 ## Capture geometry
 
@@ -264,3 +266,6 @@ See [tool lifecycle](tool-lifecycle.md) for exact triggers, supported camera
 selection, fault telemetry, the recovery operation, retry limits and external
 ER prompt customization. Stopping after a failed manipulation does not clear
 the recovery requirement: successful driver recovery is needed before retrying.
+
+See [tool outcomes and scenario coverage](tool-results.md) for each tool's
+completion/evidence source, final placement assessment and interruption policy.

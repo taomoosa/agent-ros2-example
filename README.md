@@ -45,7 +45,7 @@ captures are not replaced with cached images.
 
 `apps/inspect.md` is an observation task. `apps/pick_and_place.md` and
 `apps/dual_arm.md` use fixed-camera pixel detection, optional wrist refinement,
-coordinated pick/place, and wrist-image grasp verification. Describe the object
+coordinated pick/place, and camera-image grasp verification. Describe the object
 and destination with `--instruction`; you do not need to supply Cartesian poses.
 Separate Gemini Robotics ER requests locate and refine pixel targets. The Live
 agent itself assesses grasp success from explicit post-pick camera images and
@@ -59,7 +59,9 @@ approach geometry, grasp orientation, motion planning and synchronized control.
 See [pixel workflow and driver contract](docs/pixel-workflow.md) for tools,
 prompts, required RGB-D/TF inputs and extension points. The
 [tool lifecycle guide](docs/tool-lifecycle.md) explains triggers, fault detection,
-controlled recovery/retries and external ER prompt files.
+controlled recovery/retries and external ER prompt files. The
+[tool outcome guide](docs/tool-results.md) maps every tool to its completion
+evidence and scenario tests.
 
 The existing metric `move_arm`, `set_gripper`, and new `move_arms` tools remain
 available for measured/manual operations. They invalidate unfinished pixel plans.

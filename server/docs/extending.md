@@ -98,8 +98,8 @@ if Gemini is to request it. Neither capability is currently implemented.
 | [live_session.py](../../agent/embodiment/ros2/live_session.py) | For a new visual-evidence tool, ensure the original image reaches Live before its tool response, with matching identity; returning base64 in JSON alone does not implement the current inspection delivery mechanism |
 | [instruction.md](../../agent/embodiment/ros2/instruction.md), [application examples](../../agent/apps) | Tell Gemini when to call the tool, how to interpret failure and what to do next |
 
-Motion classifications in `_execute_action` occur in multiple success/error
-branches. Review all of them for a new motion tool; adding only its dispatch
+Register a new motion tool in `MOTION_TOOLS` in `ros2_embodiment.py` and review
+its admission, invalidation and success/error branches. Adding only its dispatch
 entry is insufficient. Keep the agent's local plan/recovery state consistent
 with the bridge. For visual tools, preserve capture provenance and evidence
 consumption so an old or undelivered image cannot authorize a new motion.

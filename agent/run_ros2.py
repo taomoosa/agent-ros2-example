@@ -54,15 +54,21 @@ async def run_application(config: RobotConfig, instruction: str, *, model: str,
         if event.get("type") == "tool_call" and event.get("name") == "finish_task":
           if embodiment.task_result is not None:
             if not embodiment.task_result["success"]:
-              await embodiment.robot.stop()
+              stopped = await embodiment.robot.stop()
+              if stopped.get('success') is not True:
+                return dict(embodiment.task_result, stop_result=stopped,
+                            operator_required=True)
             return embodiment.task_result
-    raise RuntimeError("Gemini session ended without finish_task")
+    raise RuntimeError(getattr(session, "interruption_reason", "Gemini session ended without finish_task"))
 
   try:
     return await asyncio.wait_for(consume(), timeout=timeout)
   except BaseException:
+    embodiment.interrupt(session_lost=True)
     try:
-      await embodiment.robot.stop()
+      stopped = await embodiment.robot.stop()
+      if stopped.get('success') is not True:
+        logging.error("Stop was not confirmed after interruption: %s", stopped)
     except Exception as exc:
       logging.error("Could not stop arms after application interruption: %s", exc)
     raise

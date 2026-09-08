@@ -13,6 +13,12 @@ class Manipulation:
     self.max_recovery_attempts = max_recovery_attempts
     self.recovery_attempts = 0
     self.needs_recovery = False
+    self.generation = 0
+    self.final_observation_required = False
+
+  def checkpoint(self, generation):
+    if generation != self.generation:
+      raise ValueError('Operation interrupted; discard old results and observe again')
 
   def camera(self, camera_id, mount, arm_id=None):
     camera = next((c for c in self.config.cameras if c.id == camera_id), None)
@@ -25,12 +31,15 @@ class Manipulation:
       raise ValueError('Unknown plan; detect targets first')
     return self.plans[plan_id]
 
-  def remember(self, result):
+  def remember(self, result, generation=None):
+    if generation is not None:
+      self.checkpoint(generation)
     if result.get('success') is True:
       self.plans[result['plan_id']] = result
     return result
 
   def invalidate(self):
+    self.generation += 1
     self.plans.clear()
     self.inspections.clear()
 
@@ -47,12 +56,15 @@ class Manipulation:
     self.recovery_attempts += 1
     self.invalidate()
     self.needs_recovery = True
+    generation = self.generation
     stopped = await self.robot.stop()
+    self.checkpoint(generation)
     if stopped.get('success') is not True:
       return dict(stopped, success=False, next_actions=['stop', 'finish_task'])
     # The server validates current faults and the driver decides how to support
     # and release any payload. Never open a possibly loaded gripper blindly.
     result = await self.robot.workflow('recover')
+    self.checkpoint(generation)
     if result.get('success') is True:
       self.needs_recovery = False
     return dict(result, recovery_attempts=self.recovery_attempts,
@@ -69,8 +81,15 @@ class Manipulation:
       raise ValueError('Select one or two distinct configured arms')
     if not isinstance(instruction, str) or not instruction.strip():
       raise ValueError('A detection instruction is required')
+    if any(p['state'] in {'picked', 'verified'} for p in self.plans.values()):
+      raise ValueError('Place or recover the held-object plan before detecting again')
+    if self.final_observation_required:
+      raise ValueError('Observe the placement result with get_robot_state before detecting again')
+    generation = self.generation
     capture = await self.robot.capture(camera_id)
+    self.checkpoint(generation)
     result = await self.reasoning.reason('detect', capture, instruction, arm_ids)
+    self.checkpoint(generation)
     targets = result.get('targets')
     if (set(result) != {'targets'} or not isinstance(targets, list) or len(targets) != len(arm_ids)
         or any(not isinstance(t, dict) or set(t) != {'arm_id', 'grasp', 'release'} for t in targets)
@@ -78,19 +97,22 @@ class Manipulation:
       raise ValueError('Robotics ER must locate grasp and release points for every selected arm')
     converted = [dict(arm_id=t['arm_id'], grasp=pixel(t['grasp'], capture),
                       release=pixel(t['release'], capture)) for t in targets]
-    return self.remember(await self.robot.workflow('create', capture_id=capture['capture_id'], targets=converted))
+    return self.remember(await self.robot.workflow('create', capture_id=capture['capture_id'], targets=converted), generation)
 
   async def refine_grasp(self, plan_id, arm_id, camera_id, instruction):
     plan = self.plan(plan_id)
     if plan['state'] != 'approached' or arm_id not in {t['arm_id'] for t in plan['targets']}:
       raise ValueError('Approach this plan before refining its grasp')
     self.camera(camera_id, 'flange', arm_id)
+    generation = self.generation
     capture = await self.robot.capture(camera_id)
+    self.checkpoint(generation)
     result = await self.reasoning.reason('refine', capture, instruction, [arm_id])
+    self.checkpoint(generation)
     if set(result) != {'point'}:
       raise ValueError('Invalid refinement response')
     return self.remember(await self.robot.workflow('refine', plan_id=plan_id, arm_id=arm_id,
-        capture_id=capture['capture_id'], pixel=pixel(result['point'], capture)))
+        capture_id=capture['capture_id'], pixel=pixel(result['point'], capture)), generation)
 
   async def execute(self, plan_id, stage):
     plan = self.plan(plan_id)
@@ -98,9 +120,10 @@ class Manipulation:
     if self.needs_recovery or plan['state'] not in allowed[stage]:
       raise ValueError(f'Cannot {stage} a plan in state {plan["state"]}; inspect, verify or recover first')
     self.inspections.clear()
+    generation = self.generation
     try:
       result = await self.robot.workflow('execute', plan_id=plan_id, stage=stage)
-    except Exception:
+    except BaseException:
       plan['state'] = 'invalid'
       self.needs_recovery = True
       raise
@@ -109,7 +132,10 @@ class Manipulation:
       self.needs_recovery = True
       return dict(result, next_actions=['stop', 'finish_task'] if result.get('recoverable') is False
                   else ['get_robot_state', 'recover_arms', 'finish_task'])
-    return self.remember(result)
+    self.checkpoint(generation)
+    if stage == 'place':
+      self.final_observation_required = True
+    return self.remember(result, generation)
 
   async def approach_targets(self, plan_id):
     return await self.execute(plan_id, 'approach')
@@ -187,10 +213,18 @@ class Manipulation:
     # Another assessment requires new images rather than changing the answer.
     for observation in observations:
       del self.inspections[observation['observation_id']]
+    generation = self.generation
     result = await self.robot.workflow('verify', plan_id=plan_id, observations=submitted)
+    self.checkpoint(generation)
     result['assessment'] = observations
     return self.remember(result)
 
   async def move_arms(self, moves):
+    if self.needs_recovery:
+      raise ValueError('Recover arms before issuing another manual motion')
+    if any(p['state'] in {'picked', 'verified'} for p in self.plans.values()):
+      self.needs_recovery = True
+      self.invalidate()
+      raise ValueError('Manual motion cannot discard a held-object plan; stop and recover')
     self.invalidate()
     return await self.robot.workflow('move_arms', moves=moves)

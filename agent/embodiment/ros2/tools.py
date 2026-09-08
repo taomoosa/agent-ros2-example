@@ -31,7 +31,7 @@ def ros2_tools(config: RobotConfig) -> list[dict]:
       "arm_id": arm, "opening": {"type": "NUMBER", "minimum": 0, "maximum": 1},
   }, ("arm_id", "opening"), blocking=True)
   add("stop", "Stop one arm, or all arms when arm_id is omitted.", {"arm_id": arm})
-  add("finish_task", "Finish the application after verifying its outcome in state and fresh images. "
+  add("finish_task", "Finish after get_robot_state delivers fresh state and imagery following the latest motion attempt. "
       "Report failure honestly if the task cannot be completed.", {
           "success": {"type": "BOOLEAN"}, "summary": {"type": "STRING"},
       }, ("success", "summary"))

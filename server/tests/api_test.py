@@ -83,3 +83,18 @@ class ApiTest(unittest.IsolatedAsyncioTestCase):
             content=b'{"opening": NaN}', headers={"Content-Type": "application/json"})
         self.assertEqual(422, response.status_code)
         self.assertEqual([], self.gateway.calls)
+
+    async def test_empty_commands_validate_body_before_dispatch(self):
+        for operation in ('reset', 'recover'):
+            for raw in (b'{"arm_id":"missing"}', b'null', b'[]', b'false', b'42', b'""', b'{'):
+                with self.subTest(operation=operation, raw=raw):
+                    result = await self.client.post('/v1/arms/' + operation, content=raw,
+                        headers={'Content-Type': 'application/json'})
+                    self.assertEqual(422, result.status_code)
+            self.assertEqual([], self.gateway.calls)
+            for raw in (b'', b'{}'):
+                result = await self.client.post('/v1/arms/' + operation, content=raw,
+                    headers={'Content-Type': 'application/json'})
+                self.assertEqual(200, result.status_code)
+                self.assertEqual({}, self.gateway.calls[-1][2])
+            self.gateway.calls.clear()

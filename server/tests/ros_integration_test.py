@@ -96,6 +96,7 @@ class RosIntegrationTest(unittest.IsolatedAsyncioTestCase):
             {"id": "move", "name": "move_arm", "args": {"arm_id": "right", "frame_id": "world",
                 "position": [0.2, 0, 0.4], "orientation": [0, 0, 0, 1]}},
             {"id": "grip", "name": "set_gripper", "args": {"arm_id": "right", "opening": 0.2}},
+            {"id": "state-final", "name": "get_robot_state", "args": {}},
             {"id": "done", "name": "finish_task", "args": {"success": True, "summary": "Completed"}},
         ])
         with mock.patch("model.live_api_client.GeminiLiveApiClient") as client:
@@ -108,7 +109,7 @@ class RosIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([("move_arm", "right"), ("set_gripper", "right")],
                          [(call[0], call[1]) for call in self.fixture.driver.calls])
         responses = [m["toolResponse"]["functionResponses"][0] for m in stream.messages if "toolResponse" in m]
-        self.assertEqual(["state", "move", "grip", "done"], [r["id"] for r in responses])
+        self.assertEqual(["state", "move", "grip", "state-final", "done"], [r["id"] for r in responses])
         self.assertTrue(all(r["response"].get("success", True) for r in responses))
         self.assertTrue(any("realtimeInput" in message for message in stream.messages))
 
@@ -139,6 +140,7 @@ class TcpAgentIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 {"id": "move", "name": "move_arm", "args": {"arm_id": "arm", "frame_id": "world",
                     "position": [0.2, 0, 0.4], "orientation": [0, 0, 0, 1]}},
                 {"id": "grip", "name": "set_gripper", "args": {"arm_id": "arm", "opening": 0.2}},
+                {"id": "state-final", "name": "get_robot_state", "args": {}},
                 {"id": "done", "name": "finish_task", "args": {"success": True, "summary": "Completed"}},
             ])
             with mock.patch("model.live_api_client.GeminiLiveApiClient") as client:

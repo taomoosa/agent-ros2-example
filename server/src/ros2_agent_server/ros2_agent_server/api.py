@@ -1,6 +1,8 @@
 """FastAPI HTTP endpoints; the gateway handles all ROS2 communication."""
 
-from fastapi import FastAPI
+import json
+
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 
@@ -79,13 +81,23 @@ def create_app(gateway, config):
     async def verify_plan(body: VerifyPlan):
         return await request("verify_grasp", payload=body.model_dump())
 
+    async def empty_command(operation, http_request):
+        raw = await http_request.body()
+        try:
+            payload = json.loads(raw) if raw else {}
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise BridgeError(422, "Invalid JSON request payload") from exc
+        # Validate before the helper supplies defaults: null and [] are not {}.
+        payload = validate_request(config, operation, "", payload)
+        return await request(operation, payload=payload, timeout=60.0)
+
     @app.post("/v1/arms/reset")
-    async def reset_arms():
-        return await request("reset_arms", timeout=60.0)
+    async def reset_arms(http_request: Request):
+        return await empty_command("reset_arms", http_request)
 
     @app.post("/v1/arms/recover")
-    async def recover_arms():
-        return await request("recover_arms", timeout=60.0)
+    async def recover_arms(http_request: Request):
+        return await empty_command("recover_arms", http_request)
 
     @app.post("/v1/arms/poses")
     async def move_arms(body: MoveArms):

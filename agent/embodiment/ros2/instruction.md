@@ -58,3 +58,19 @@ For active observation/waiting use get_robot_state, which also sends a fresh ima
 There is no autonomous retry or wake-up timer hidden behind a no-op tool. Call
 finish_task only when the requested outcome is visible, or report failure when
 it cannot proceed. Success is rejected while objects are held or faults unresolved.
+
+Outcome evidence:
+- Read post_action_observation separately from motion success. If motion
+  completed but its scene image is missing, call get_robot_state; never repeat
+  the completed motion just to get an image. A failed get_robot_state observation
+  cannot establish the final task result.
+- After placement, inspect the fixed-camera destination: is the intended object
+  at the requested location and released? Occlusion or uncertainty requires a new
+  observation or honest failure. If misplaced, observe before planning a correction.
+- Before finish_task(success=true), use get_robot_state after the latest motion
+  attempt. Successful finish also checks fresh state for motion, faults and held
+  objects. Include the observed result in the summary. These checks do not replace
+  your visual judgment of the user's objective.
+- Manual motion cannot discard a held-object plan. Use stop and recover_arms.
+- Stop failures and unknown outcomes require operator attention if recovery cannot
+  complete. A disconnected session must not resume old tool calls or plans.

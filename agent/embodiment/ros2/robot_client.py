@@ -35,12 +35,17 @@ class Ros2RobotClient:
     # Motion requests are deliberately sent once: a timeout has an unknown outcome.
     response = await self._client.request(method, path, **kwargs)
     response.raise_for_status()
-    if response.status_code == 202:
+    if response.status_code != 200:
       return {"success": False, "outcome": "unknown",
               "error": "Expected completed operation; asynchronous acceptance is unsupported"}
-    result = response.json()
-    if not isinstance(result, dict):
-      raise ValueError("The robot server must return a JSON object")
+    try:
+      result = response.json()
+      if not isinstance(result, dict):
+        raise ValueError("The robot server must return a JSON object")
+      if method == 'POST' and type(result.get('success')) is not bool:
+        raise ValueError("The robot server must report boolean completion")
+    except ValueError as exc:
+      raise httpx.RemoteProtocolError(str(exc), request=response.request) from exc
     return result
 
   async def get_robot_state(self):

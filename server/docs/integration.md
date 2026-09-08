@@ -238,3 +238,8 @@ or test harness. Finally validate calibration, reachable points, grasp geometry,
 physical stopping/recovery and synchronization on your hardware before running
 the supplied pick/place application. Repository tests mock hardware and Gemini;
 they cannot establish those physical properties.
+
+For result fields, final visual assessment and the policy after a Gemini
+connection loss or bridge restart, see [tool outcomes](../../docs/tool-results.md).
+Bridge state is in memory; establish stopped, known hardware state before
+restarting an application after an interrupted process.
