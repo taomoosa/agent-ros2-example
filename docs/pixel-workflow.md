@@ -23,12 +23,12 @@ sequenceDiagram
     Driver-->>Live: Completed result through ROS, HTTP and agent
     Live->>Agent: detect_targets(camera, instruction, arms)
     Agent->>HTTP: GET camera capture
-    HTTP->>ROS: Capture new RGB + aligned depth + timestamped TF
+    HTTP->>ROS: Capture new RGB with configured depth/TF or fixed-plane calibration
     ROS-->>Agent: Capture ID, original image, frozen metadata
     Agent->>ER: Original image + detection prompt
     ER-->>Agent: Normalized grasp/release points per arm
     Agent->>HTTP: POST /v1/plans with original-image pixels
-    HTTP->>ROS: Project with measured depth and frozen camera transform
+    HTTP->>ROS: Project with frozen depth/TF or calibrated plane
     ROS-->>Live: Plan ID and targets through HTTP and agent
     opt Wrist refinement
         Live->>Agent: approach_targets(plan), then refine_grasp
@@ -43,7 +43,7 @@ sequenceDiagram
     ROS->>Driver: One request: open, approach, descend, close, lift
     loop Each participating arm
         Live->>Agent: inspect_grasp(plan, arm)
-        Agent->>ROS: Fresh post-pick wrist capture and state through HTTP
+        Agent->>ROS: Fresh post-pick wrist or fixed RGB observation and state through HTTP
         Agent-->>Live: Original inspection image, observation ID, arm state
     end
     Live->>Agent: verify_grasp(plan, observations with success and reason)
@@ -63,8 +63,9 @@ For grasp assessment, `inspect_grasp` captures an original inspection image and 
 The ROS2-specific `live_session.py` sends this image immediately before its tool
 response, under the shared stream lock, and records delivery. The Live agent
 then calls `verify_grasp` with its own assessment. Original upstream session/tool
-execution code is unchanged by this feature. Tools run serially at the agent boundary; each grouped operation
-contains both arms and requires coordinated execution inside the driver.
+execution code is unchanged by this feature. Ordinary actions run serially at
+the agent boundary; stop bypasses the action lock. Grouped operations contain
+all participating arms (one or two) and require coordinated execution in the driver.
 
 | Tool | Purpose |
 |---|---|
@@ -139,42 +140,55 @@ For example, after inspecting both arms, the Live agent may call:
 ```
 
 This assessment leaves the plan in `picked` and blocks placement. Gripper
-telemetry includes `opening` and optional `fault` / `object_detected` fields.
-Opening-only messages remain valid. Closed jaws or null/missing sensor readings
+telemetry accepts nullable/optional `opening`, `fault` and `object_detected`
+fields in the required `gripper` object. The complete ROS state also requires
+measurement `stamp_ns`, `moving` and `flange_pose`; see
+[telemetry](../server/docs/telemetry.md). Closed jaws or null/missing sensor readings
 are not proof of grasp; `object_detected: false` blocks a positive visual
 assessment and placement. No force/contact sensor inference is fabricated.
 Use a new inspection or stop when the evidence is insufficient.
 
 ## Capture geometry
 
-In addition to the existing JPEG topic, each camera used by the pixel workflow
-must publish the following with sensor-data QoS:
+For the default `projection: "depth"`, each camera used for detection or
+refinement must provide the following inputs in addition to JPEG. CameraInfo and depth use
+sensor-data QoS; TF uses the standard dynamic/static TF publishers:
 
 | Topic | Message | Requirement |
 |---|---|---|
-| `/robotics/cameras/{id}/camera_info` | `sensor_msgs/CameraInfo` | Rectified pinhole K, matching full image dimensions and optical frame; zero distortion, no cropped ROI or downsampling |
-| `/robotics/cameras/{id}/depth/aligned` | `sensor_msgs/Image` | Depth aligned to RGB, identical acquisition timestamp, optical frame and dimensions; `16UC1` millimetres or `32FC1` metres |
+| `/robotics/cameras/{id}/camera_info` | `sensor_msgs/CameraInfo` | Matching full rectified image grid; select rectified K or standard rectified P via [CameraInfo mode](../server/docs/camera-info.md). Cropping, nonidentity R and stereo offsets are unsupported |
+| `/robotics/cameras/{id}/depth/aligned` | `sensor_msgs/Image` | Color-grid/color-Z depth, matching dimensions, configured depth header frame and acquisition-time tolerance; `16UC1` millimetres or `32FC1` metres |
 | `/tf`, `/tf_static` | Standard TF messages | Transform from camera optical frame to world at image acquisition; additionally flange-to-world at that same time for wrist cameras |
 
 Calibration may be published independently of each exposure, but must describe
 the current image geometry. Publishers must share the ROS clock. The server
 waits for a new image and matching depth/TF; it never substitutes the latest
-arm-state JSON pose for a capture-time transform. Depth row stride and byte
-order are respected. Zero/non-finite depth, invalid calibration or mismatched
-geometry fails conversion. Missing synchronized data/TF returns 504.
+arm telemetry pose for a capture-time transform. Depth row stride and byte
+order are respected. Out-of-range/non-finite depth, insufficient local depth
+support, invalid calibration or mismatched geometry fails conversion. Missing synchronized data/TF returns 504.
 
 For pixel `(u,v)` with measured optical-axis depth `z`, the bridge computes
 `[(u-cx)*z/fx, (v-cy)*z/fy, z]`, then applies the frozen camera-to-world transform.
 This is a surface/contact point, **not a flange pose**. The driver applies tool
 geometry, grasp orientation, object/support offsets and approach clearances.
-The same projection is used for destination support surfaces. Monocular
-plane/depth estimation is not implemented; RGB-D or an upstream node supplying
-registered measured depth is required. The current capture endpoint also uses
-this geometry contract for verification images.
+The same projection is used for destination support surfaces. Fixed cameras can
+alternatively use [offline plane calibration](../server/docs/plane-projection.md)
+with `projection: "plane"`; capture then needs only fresh RGB and the configured
+homography/plane pose. Both selected points must lie on that calibrated plane.
+Automatic monocular depth/plane estimation is not implemented. Wrist refinement
+still requires registered measured depth and image-time TF. Grasp inspection
+uses the depth-free `/observation` endpoint.
 
-Snapshots have opaque IDs, last at most 120 seconds, and are bounded to 64
+See [camera synchronization](../server/docs/synchronization.md) for bounded
+approximate pairing, frame aliases, source timestamps, TF interpolation and
+calibration/clock changes. The default pairing tolerance is 10 ms; tune it to
+measured timing and acceptable error, or set it to zero for strict pairing.
+See [numerical tolerances](../server/docs/numerical-tolerances.md) for the separate
+5 ms future-clock allowance, calibration rounding and depth quality checks.
+
+Snapshots have opaque IDs, last for `server.capture_ttl` (default 300 seconds), and are bounded to 64
 entries. Up to 32 plans are retained; detected/approached plans expire after
-120 seconds. A motion invalidates other unfinished plans and pre-motion
+`server.plan_ttl` (default 600 seconds). A motion invalidates other unfinished plans and pre-motion
 snapshots. A plan stores its converted world points and capture provenance;
 subsequent camera movement cannot change them. Source JPEGs can be evicted
 without changing the converted points. Re-detect after scene changes.
@@ -183,12 +197,15 @@ without changing the converted points. Re-detect after scene changes.
 
 | Method and path | JSON body / result |
 |---|---|
-| `GET /v1/cameras/{id}/capture` | Returns `capture_id`, `camera_id`, `width`, `height`, `stamp_ns`, `frame_id`, `camera_pose`, nullable `flange_pose`, `image_base64` |
+| `GET /v1/cameras/{id}/capture` | Returns `kind: "rgbd"`, `capture_id`, `camera_id`, `width`, `height`, RGB `stamp_ns` / `frame_id`, `camera_pose`, nullable `flange_pose`, `image_base64`, `depth_stamp_ns`, `depth_frame_id`, `camera_info_frame_id`, `camera_info_stamp_ns`, signed `sync_delta_ns` and RGB `pose_stamp_ns` |
+| `GET /v1/cameras/{id}/capture` (plane mode) | Returns `kind: "plane"`, common capture ID/image/dimensions/frame/time fields, and frozen `plane_calibration`; no depth or camera/flange poses |
+| `GET /v1/cameras/{id}/observation` | Returns `kind: "rgb"`, `capture_id`, `camera_id`, `width`, `height`, `stamp_ns`, `frame_id`, `image_base64`; valid for visual verification, not metric projection |
 | `POST /v1/plans` | `{capture_id, targets: [{arm_id, grasp: [x,y], release: [x,y]}]}` |
 | `POST /v1/plans/refine` | `{plan_id, arm_id, capture_id, pixel: [x,y]}` |
-| `POST /v1/plans/execute` | `{plan_id, stage: "approach" | "pick" | "place"}` |
+| `POST /v1/plans/execute` | `{plan_id, stage: "approach" \| "pick" \| "place"}` |
 | `POST /v1/plans/verify` | `{plan_id, observations: [{arm_id, capture_id, success: boolean}]}` |
-| `POST /v1/arms/reset` | No arguments; all configured arms |
+| `POST /v1/arms/reset` | Omitted body or `{}`; all configured arms |
+| `POST /v1/arms/recover` | Omitted body or `{}`; all configured arms after successful all-arm stop |
 | `POST /v1/arms/poses` | `{moves: [{arm_id, frame_id, position, orientation, duration?}]}` |
 
 Plan responses include `success`, `plan_id`, `state`, and per-arm `targets` with
@@ -197,7 +214,8 @@ and `stamp_ns`. Completed stages also include `motion_stamp_ns`.
 
 States are `detected → approached (optional) → picked → verified → placed`.
 Refinement is allowed only after approach and only from that arm's newer wrist
-image. Verification must cover every selected arm using fixed-camera or matching wrist images acquired
+RGB-D capture, with both exposures after approach completion. Verification must
+cover every selected arm using fixed-camera or matching wrist images acquired
 **after pick completion**. A false visual result retains `picked`, so placement
 remains blocked; inspect again or stop. Verification is supplied by the trusted
 Live agent, not cryptographically attested. The agent submits an observation ID
@@ -208,7 +226,8 @@ failure; changing a failed judgment requires new inspection images. Reasons
 are included in the tool result/log; the unchanged server verification endpoint
 receives bound capture IDs and booleans. A placed or interrupted plan cannot be replayed.
 The bridge admits one motion at a time, with stop and observation still available.
-Reset, stop and manual motions invalidate unfinished plans. Unknown outcomes
+Reset, stop and manual motions invalidate unfinished plans. Reset/manual motions
+cannot discard a held-object plan; stop and recover first. Unknown outcomes
 require a successful stop of **all** arms and driver recovery before another attempt;
 a stop of one arm does not resolve uncertainty about its peer.
 
@@ -221,8 +240,9 @@ operation. The driver must support:
 - `move_arms`: payload `{moves, arm_ids, coordinated: true}`. Plan a common
   trajectory and completion barrier for all requested flange poses.
 - `execute_plan`: payload `{plan_id, stage, targets, phases, coordinated: true}`.
-  `targets` contains all participating arms and their measured world contact
-  points. `approach` uses `["approach"]`; `pick` uses
+  `targets` contains all participating arms and their projected world contact
+  points. Plane-derived points also carry `projection: "plane"` and
+  `calibration_id`; accept these provenance fields in the driver adapter. `approach` uses `["approach"]`; `pick` uses
   `["open", "approach", "descend", "close", "lift"]`; `place` uses
   `["transfer", "descend", "open", "retreat"]`.
 
@@ -239,8 +259,13 @@ A plain `success: true` or a 202 acceptance is insufficient. Partial/failing
 execution must report failure, with `outcome: "unknown"` when appropriate.
 The bridge never retries motion, invalidates the plan on failure, and rejects
 new commands after unknown completion until all arms are stopped and recovered. Stage/reset/
-group-move requests have a 60-second ROS deadline and 65-second HTTP client
-budget. Stopping physical motion is the driver's responsibility even if the
+group-move requests use configurable execution/settling/state/delivery budgets
+(default 141-second bridge and 146-second agent budgets). See
+[time budgets](../server/docs/time-budgets.md). A successful driver motion reply is followed by a bounded wait for
+subsequent state measured at or after acknowledgement receipt from every target
+arm; this does not extend the original deadline. See
+[completion telemetry](../server/docs/telemetry.md#freshness-and-command-completion).
+Stopping physical motion is the driver's responsibility even if the
 ROS service future times out or is cancelled.
 
 This repository implements capture/projection, orchestration, requests and

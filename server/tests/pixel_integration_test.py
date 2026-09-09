@@ -71,6 +71,36 @@ class PixelIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(200,response.status_code,response.text)
         return response.json()
 
+    async def test_agent_can_reobserve_after_depth_quality_failure(self):
+        import struct
+        from embodiment.ros2.config import RobotConfig as AgentConfig
+        from embodiment.ros2.manipulation import Manipulation
+        from embodiment.ros2.robot_client import Ros2RobotClient
+        agent_config = AgentConfig.load(ROOT / 'agent/configs/dual_arm.json')
+        robot = Ros2RobotClient(agent_config, transport=httpx.ASGITransport(app=self.app))
+        self.addAsyncCleanup(robot.close)
+        reasoning = mock.Mock()
+        reasoning.reason = mock.AsyncMock(return_value={'targets': [
+            dict(arm_id='left', grasp=[500,500], release=[500,750])]})
+        tools = Manipulation(agent_config, robot, reasoning)
+        # An in-range outlier cannot be detected by min/max bounds alone.
+        depth = [1000]*(48*32)
+        depth[16*48+24] = 2000
+        self.fixture.driver.depth_data = struct.pack('<1536H', *depth)
+        with self.assertRaises(httpx.HTTPStatusError) as error:
+            await tools.detect_targets('overhead', 'Move the workpiece', ['left'])
+        self.assertEqual(422, error.exception.response.status_code)
+        self.assertEqual('depth_quality_invalid', error.exception.response.json()['code'])
+        self.assertFalse(tools.plans)
+        first_capture = reasoning.reason.call_args.args[1]['capture_id']
+        self.fixture.driver.depth_data = struct.pack('<1536H', *[
+            1000+(i % 3-1)*5 for i in range(48*32)])
+        result = await tools.detect_targets('overhead', 'Reobserve and locate the workpiece', ['left'])
+        self.assertTrue(result['success'], result)
+        self.assertNotEqual(first_capture, reasoning.reason.call_args.args[1]['capture_id'])
+        self.assertAlmostEqual(1., result['targets'][0]['grasp']['position'][2], delta=.005001)
+        self.assertFalse(self.fixture.driver.calls)
+
     async def test_capture_binds_tf_at_exposure_not_current_arm_pose(self):
         capture = await self.capture('left_wrist')
         self.assertAlmostEqual(1.,capture['camera_pose']['position'][0])

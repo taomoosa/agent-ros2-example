@@ -5,6 +5,7 @@ import uuid
 from embodiment.ros2.robotics_er import pixel
 
 
+# TOOL EXTENSION: compose workflows and preserve plan/evidence generations here.
 class Manipulation:
   def __init__(self, config, robot, reasoning, *, max_recovery_attempts=2):
     self.config, self.robot, self.reasoning = config, robot, reasoning
@@ -163,7 +164,7 @@ class Manipulation:
       camera = next((c for c in eligible if c.mount == 'flange'), next(iter(eligible), None))
     if camera is None:
       raise ValueError('Use a configured fixed camera or this arm wrist camera')
-    capture = await self.robot.capture(camera.id)
+    capture = await self.robot.observation(camera.id)
     if capture['stamp_ns'] <= plan['motion_stamp_ns']:
       raise ValueError('Inspection must use an image acquired after pick completion')
     state = await self.robot.get_robot_state()

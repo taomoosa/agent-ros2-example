@@ -8,14 +8,15 @@ and a driver adapter; see [first-time integration](integration.md).
 
 | Desired change | Files/components to change |
 |---|---|
+| Fixed-camera pixels on a known plane instead of depth | Configure [plane projection](plane-projection.md) and offline calibration; no new tool or ROS message type |
 | Different home pose, gripper hardware, controller or recovery trajectory | Your driver package/configuration; keep the existing HTTP/ROS operation contract |
-| Different topic names with compatible content | ROS remapping or `server.namespace`; no new tool or server source required |
+| Different topic/service names with compatible content | Keep overrides in `server.remappings`; see [ROS names](ros-names.md). Existing namespace/CLI settings remain supported |
 | Different sensor message/geometry | Your upstream adapter; change server subscriptions/models only if intentionally extending the contract |
 | Different task wording or ER contact-point guidance | Agent application/system instruction or ER prompt files; no server changes |
 | New agent tool composing existing operations | Agent declaration, dispatch and implementation; reuse existing HTTP client calls and lifecycle guards |
 | New telemetry exposed through state | Publisher adapter, server state model/storage, and any agent presentation/validation using that field |
 | New HTTP operation or ROS capability | Request model/validation, route, bridge handler, optional driver implementation, agent tool/client if exposed to Gemini, tests and contract docs |
-| New ROS message/service type | Interface package and ROS build metadata, plus publishers/subscribers or clients/servers using it |
+| Existing controller uses another standard ROS type | Map it in an adapter; keep the standard String state boundary. No custom state message is required |
 
 Tool names, HTTP routes and ROS operation strings are distinct interfaces. For
 example, `pick_targets` calls `POST /v1/plans/execute` with `stage="pick"`; the
@@ -28,6 +29,7 @@ Paths below are relative to `server/` and link to the current implementation.
 
 | File / symbol | When and what to change |
 |---|---|
+| [ros_names.py](../src/ros2_agent_server/ros2_agent_server/ros_names.py): `RosNames` | Define new connection names here; use its helpers in nodes and fixture publishers. Installation-specific overrides belong in the shared JSON map |
 | [models.py](../src/ros2_agent_server/ros2_agent_server/models.py): `Model`, `RobotConfig`, `ArmState` | Add strict request/state/config fields, types and ranges. New config fields need compatible agent configuration parsing too |
 | [workflow.py](../src/ros2_agent_server/ros2_agent_server/workflow.py): request classes, `BODIES`, `validate_workflow` | Add workflow request shapes and validate resource IDs, uniqueness, frames and bounds |
 | [protocol.py](../src/ros2_agent_server/ros2_agent_server/protocol.py): `validate_request`, `Reply`, `BridgeError` | Register non-workflow operations and their resource/body validation; maintain consistent success/failure transport |
@@ -59,13 +61,15 @@ Paths below are relative to `server/` and link to the current implementation.
    HTTP and direct `RobotRequest` callers must pass the same validation; a
    FastAPI-only check leaves the ROS service unprotected from invalid input.
 4. Add bridge execution. For new read-only telemetry, use an explicit branch
-   in `_request` alongside `state`/`camera`/`capture`. For plan computation, add
-   an explicit guarded branch in `_workflow`. **The remaining `_workflow`
+   in `_request` alongside `state`/`camera`/`capture`/`observation`. For plan
+   computation, add an explicit guarded branch in `_workflow`. **The remaining `_workflow`
    path treats requests as motion**: simply accepting a new operation in
    validation can send it to the driver and invalidate plans. Decide whether
    the new operation remains available during active motion or recovery.
 5. For motion, define participating arm IDs and retain health/recovery checks,
    busy admission, stop interruption, invalidation and unknown-outcome handling.
+   Preserve the post-acknowledgement measured-state wait for every target arm
+   within the original deadline; see [completion telemetry](telemetry.md).
    A new grouped operation must enter the `grouped` classification and derive
    its actual requested arms explicitly; the existing fallback selects all
    configured arms. Add payload enrichment and exact per-arm completion checks.
@@ -74,9 +78,9 @@ Paths below are relative to `server/` and link to the current implementation.
 6. Implement the operation in your driver if physical work is needed. Keep
    service waits asynchronous, report completion rather than action acceptance,
    and keep stop runnable. Define recovery for partial execution; do not add an
-   automatic motion retry. The current internal timeout range is `(0, 65]`
-   seconds; align HTTP route, gateway, driver and agent budgets. Longer-running
-   work needs a deliberate contract change, not just a larger driver timeout.
+   automatic motion retry. The current internal timeout range is `(0, 15000]`
+   seconds; align HTTP route, gateway, driver and agent budgets. Configure the shared operation budgets and propagate `deadline_ns`; see
+   [time budgets](time-budgets.md). Do not increase only the driver timeout.
 7. Expose the capability to the agent when needed, following the map below.
    Update prompts, application examples, lifecycle hints and tests together.
 
@@ -159,3 +163,30 @@ pending request, recovery followed by a new plan, and one fixed camera with one
 arm. Add new tests that exercise the changed behavior; mock success alone does
 not establish that failures remain detectable or recoverable. Document any
 additional hardware validation required by the new capability.
+
+## Finding extension points in source
+
+Search from the repository root:
+
+```bash
+rg -n 'HARDWARE INTEGRATION|TOOL EXTENSION' server/src agent/embodiment/ros2
+```
+
+`HARDWARE INTEGRATION` marks the state JSON contract and input boundary,
+camera geometry configuration/projection assumptions, driver service boundary,
+and package data installation. Implement hardware commands in your driver
+package; a marker at `_command` does not mean bypassing common motion guards.
+
+`TOOL EXTENSION` marks Gemini declarations, motion classification, HTTP client
+and routes, direct ROS validation, workflow body registration, bridge admission,
+plan/evidence composition and original-image delivery. Follow the file maps
+above to update prompts, applications, deadlines and tests too. An observation-
+only tool needs an explicit branch before `_workflow`'s motion fallback. RGB
+observation IDs cannot be used as metric captures.
+
+Examples to trace without adding dummy tools: `move_arms` for group motion,
+`detect_targets` for ER plus geometric plan creation, and `inspect_grasp` for RGB
+evidence followed by `verify_grasp`. Upstream copied dispatch code normally stays
+unchanged. See [synchronization](synchronization.md) for camera extension contracts
+and [telemetry](telemetry.md) before adding state fields. State publishing uses
+standard String JSON; do not introduce a repository-specific state message.

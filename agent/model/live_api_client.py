@@ -64,7 +64,10 @@ class GeminiLiveApiStream:
     logger.debug("GeminiLiveApiStream._read_loop() thread started")
     try:
       while True:
-        opcode, data = self._ws.recv_data()
+        try:
+          opcode, data = self._ws.recv_data()
+        except websocket.WebSocketTimeoutException:
+          continue  # Bounded socket I/O need not disconnect an idle live session.
         if opcode == websocket.ABNF.OPCODE_CLOSE:
           import struct  # pylint: disable=g-import-not-at-top
           code = 1000
@@ -168,11 +171,11 @@ class GeminiLiveApiClient:
         _LIVE_API_WSS_URL,
     )
 
-  def create_stream(self) -> GeminiLiveApiStream:
+  def create_stream(self, timeout=None) -> GeminiLiveApiStream:
     """Create a new WebSocket connection and return a stream wrapper."""
     ws = websocket.create_connection(
         self._url,
-        header={"Content-Type": "application/json"},
+        header={"Content-Type": "application/json"}, timeout=timeout,
     )
     logger.info("WebSocket connection established to Gemini Live API")
     return GeminiLiveApiStream(ws)

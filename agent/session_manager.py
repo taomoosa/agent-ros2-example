@@ -136,6 +136,15 @@ class SessionManager:
     if self.tool_handler:
       self.tool_handler.set_embodiment(embodiment)
 
+  async def _create_stream(self):
+    return self.client.create_stream()
+
+  async def _shutdown_stream(self):
+    self.stream.Shutdown()
+
+  async def _send_stream(self, message):
+    await asyncio.get_running_loop().run_in_executor(None, self.stream.Send, message)
+
   async def send_message(self, msg: Any) -> None:
     """Send a JSON message to the Gemini Live API stream.
 
@@ -144,9 +153,7 @@ class SessionManager:
     """
     assert self.stream is not None, "Stream is not initialized"
     async with self._stream_lock:
-      await asyncio.get_running_loop().run_in_executor(
-          None, self.stream.Send, msg
-      )
+      await self._send_stream(msg)
 
   async def send_text_with_fresh_video(self, text: str) -> None:
     """Atomically send a current Spot frame followed by user text."""
@@ -155,7 +162,7 @@ class SessionManager:
     if poller is not None:
       try:
         chunk = await asyncio.wait_for(
-            poller.wait_for_next_frame(), timeout=2.0
+            poller.wait_for_next_frame(), timeout=getattr(self.embodiment, "observation_timeout", 2.0)
         )
       except asyncio.TimeoutError:
         logger.warning("Timed out waiting for a pre-text camera frame")
@@ -184,9 +191,7 @@ class SessionManager:
     assert self.stream is not None, "Stream is not initialized"
     async with self._stream_lock:
       for message in messages:
-        await asyncio.get_running_loop().run_in_executor(
-            None, self.stream.Send, message
-        )
+        await self._send_stream(message)
     if chunk:
       logger.info("Sent synchronized fresh video frame with user text")
 
@@ -339,7 +344,7 @@ class SessionManager:
       )
       await asyncio.sleep(wait_time)
       try:
-        self.stream = self.client.create_stream()
+        self.stream = await self._create_stream()
         self.stream.Start(
             lambda msg: self._on_message(msg),
             lambda: self._on_done(),
@@ -362,7 +367,7 @@ class SessionManager:
     self.observation.session_start_time = self.session_start_time
 
     # --- Create the Gemini stream ---
-    self.stream = self.client.create_stream()
+    self.stream = await self._create_stream()
     self.stream.Start(
         lambda msg: self._on_message(msg),
         lambda: self._on_done(),
@@ -685,7 +690,7 @@ class SessionManager:
       await self.bus.shutdown()
       if self.stream:
         try:
-          self.stream.Shutdown()
+          await self._shutdown_stream()
         except Exception:  # pylint: disable=broad-except
           pass
         self.stream = None

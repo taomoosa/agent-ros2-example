@@ -3,16 +3,38 @@
 import asyncio
 
 from session_manager import SessionManager
+from embodiment.ros2.bounded_io import thread_call
 
+
+# TOOL EXTENSION: deliver original visual evidence before its response; see server/docs/extending.md.
 
 class Ros2SessionManager(SessionManager):
   def __init__(self, *args, **kwargs):
     super().__init__(*args, **kwargs)
+    self._last_activity = self.loop.time()
     self._last_inspection_frame = float('-inf')
     self._frame_results = {}
     self._sent_results = {}
     self._call_ids = set()
     self.interruption_reason = 'Gemini session disconnected; inspect and recover before restarting'
+
+  async def _create_stream(self):
+    timing = self.embodiment.config.timing
+    return await thread_call(lambda: self.client.create_stream(timeout=timing.live_io_timeout),
+        timing.live_io_timeout, abandoned=lambda stream: stream.Shutdown())
+
+  async def _shutdown_stream(self):
+    if self.stream is not None:
+      await thread_call(self.stream.Shutdown, self.embodiment.config.timing.cleanup_timeout)
+
+  async def _send_stream(self, message):
+    try:
+      await thread_call(lambda: self.stream.Send(message), self.embodiment.config.timing.live_io_timeout)
+    except (TimeoutError, OSError, RuntimeError):
+      self.embodiment.interrupt(session_lost=True)
+      raise
+    if "realtimeInput" not in message:
+      self._last_activity = self.loop.time()
 
   def _on_done(self):
     if not self.loop.is_closed():
@@ -22,6 +44,7 @@ class Ros2SessionManager(SessionManager):
   def _on_message(self, message):
     # WebSocket callbacks may run on a worker thread; admission belongs to the loop.
     def accept():
+      self._last_activity = self.loop.time()
       if self.embodiment.session_lost:
         return
       calls = (message or {}).get('toolCall', {}).get('functionCalls', [])
@@ -50,9 +73,10 @@ class Ros2SessionManager(SessionManager):
     # The caller holds the upstream stream lock across image and tool response.
     if self.stream is None:
       raise RuntimeError('Stream is not initialized')
-    await asyncio.get_running_loop().run_in_executor(None, self.stream.Send, message)
+    await self._send_stream(message)
 
-  async def send_latest_video_frame(self, timeout=2.0):
+  async def send_latest_video_frame(self, timeout=None):
+    timeout = self.embodiment.observation_timeout if timeout is None else timeout
     generation = self.embodiment._stop_generation
     revision = self.embodiment.observation_revision
     sent = False
@@ -63,6 +87,14 @@ class Ros2SessionManager(SessionManager):
     return sent
 
   async def send_message(self, message):
+    try:
+      async with asyncio.timeout(self.embodiment.observation_timeout):
+        return await self._send_message(message)
+    except TimeoutError:
+      self.embodiment.interrupt(session_lost=True)
+      raise
+
+  async def _send_message(self, message):
     manipulation = self.embodiment.manipulation
     responses = message.get('toolResponse', {}).get('functionResponses', [])
     observation = self._frame_results.pop(asyncio.current_task(), None) if responses else None

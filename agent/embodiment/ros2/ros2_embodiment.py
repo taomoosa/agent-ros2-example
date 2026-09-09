@@ -16,6 +16,7 @@ from embodiment.ros2.robotics_er import RoboticsER, DEFAULT_ROBOTICS_MODEL
 from embodiment.ros2.manipulation import Manipulation
 
 
+# TOOL EXTENSION: classify motion here as well as dispatch; preserve stop/recovery guards.
 MOTION_TOOLS = frozenset({'move_arm', 'set_gripper', 'move_arms', 'reset_arms',
                           'recover_arms', 'approach_targets', 'pick_targets', 'place_targets'})
 
@@ -31,7 +32,7 @@ class Ros2Embodiment(base.Embodiment):
     self.video_queue = asyncio.Queue(maxsize=1)
     self.text_queue = asyncio.Queue()
     self.reasoning = RoboticsER(api_key, model=robotics_model, transport=robotics_transport,
-                               prompt_files=er_prompt_files)
+                               prompt_files=er_prompt_files, timeout=config.timing.er_timeout)
     self.robot = Ros2RobotClient(config, transport=transport)
     self.manipulation = Manipulation(config, self.robot, self.reasoning,
                                     max_recovery_attempts=max_recovery_attempts)
@@ -42,6 +43,8 @@ class Ros2Embodiment(base.Embodiment):
     self._stop_generation = 0
     self._motion_active = False
     self.session_lost = False
+    self.session_lost_event = asyncio.Event()
+    self.observation_timeout = config.timing.observation_timeout
     self.observation_revision = 0
     self.scene_revision = None
 
@@ -74,6 +77,8 @@ class Ros2Embodiment(base.Embodiment):
   def interrupt(self, *, session_lost=False):
     self._stop_generation += 1
     self.session_lost |= session_lost
+    if session_lost:
+      self.session_lost_event.set()
     self.manipulation.needs_recovery |= self._motion_active or session_lost or any(
         p['state'] in {'picked', 'verified'} for p in self.manipulation.plans.values())
     self.manipulation.invalidate()
@@ -92,6 +97,15 @@ class Ros2Embodiment(base.Embodiment):
         self.observation_revision += 1
       try:
         result = await self._execute_action(action_name, **kwargs)
+        if self._motion_active and (result.get('outcome') == 'unknown' or result.get('http_status', 0) >= 500):
+          # An uncertain motion is stopped before waiting for another model turn.
+          self.manipulation.needs_recovery = True
+          try:
+            result['stop_result'] = await self.robot.stop()
+            result['operator_required'] = result['stop_result'].get('success') is not True
+          except httpx.HTTPError as exc:
+            result['stop_result'] = {'success': False, 'error': str(exc)}
+            result['operator_required'] = True
         if generation != self._stop_generation:
           self.manipulation.invalidate()
           if action_name == 'finish_task':

@@ -28,7 +28,7 @@ class GraspAssessmentTest(unittest.IsolatedAsyncioTestCase):
       self.sequence += 1
       return dict(camera_id=camera_id,capture_id=f'capture{self.sequence}',stamp_ns=self.sequence,
                   image_base64=self.encoded,width=80,height=60)
-    self.embodiment.robot.capture = mock.AsyncMock(side_effect=capture)
+    self.embodiment.robot.observation = mock.AsyncMock(side_effect=capture)
     self.embodiment.robot.get_robot_state = mock.AsyncMock(return_value={'arms':[
         dict(id=arm,moving=False,gripper={'opening':0.}) for arm in ('left','right')]})
     self.embodiment.robot.workflow = mock.AsyncMock(return_value=dict(
@@ -106,7 +106,8 @@ class GraspAssessmentTest(unittest.IsolatedAsyncioTestCase):
       await self.session.send_message({'toolResponse':{'functionResponses':[
           dict(name='inspect_grasp',response=dict(success=True,observation_id=observation['observation_id']))]}})
     self.assertEqual({},self.manipulation.inspections)
-    await self.inspect('left',deliver=False)
+    self.assertTrue(self.embodiment.session_lost)
+    self.assertFalse((await self.embodiment.execute_action('inspect_grasp',plan_id='p',arm_id='left'))['success'])
     self.manipulation.invalidate()
     self.assertEqual({},self.manipulation.inspections)
     with self.assertRaises(ValueError):

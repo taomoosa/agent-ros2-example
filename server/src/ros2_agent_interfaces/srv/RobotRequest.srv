@@ -1,8 +1,11 @@
 # Internal bridge protocol. Commands must respond after completion.
+string request_id
 string operation
 string resource_id
 string payload_json
 float64 timeout_sec
+# Shared ROS-clock deadline; zero is reserved for direct legacy callers.
+uint64 deadline_ns
 ---
 int32 status_code
 string payload_json

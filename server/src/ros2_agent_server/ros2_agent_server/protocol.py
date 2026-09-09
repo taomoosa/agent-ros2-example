@@ -9,10 +9,14 @@ from .models import MoveArm, Gripper, Stop
 
 
 class BridgeError(Exception):
-    def __init__(self, status: int, message: str, *, outcome=None):
+    def __init__(self, status: int, message: str, *, outcome=None, code=None, details=None):
         super().__init__(message)
         self.status = status
         self.payload = {"success": False, "error": message}
+        if code:
+            self.payload["code"] = code
+        if details is not None:
+            self.payload["details"] = details
         if outcome:
             self.payload["outcome"] = outcome
 
@@ -39,15 +43,18 @@ class Reply:
     def from_ros(cls, response):
         try:
             payload = json.loads(response.payload_json)
-            if not isinstance(payload, dict) or not 200 <= response.status_code <= 599:
-                raise ValueError("Invalid response")
+            if not isinstance(payload, dict):
+                raise ValueError(f"payload_json: expected object; actual {type(payload).__name__}")
+            if not 200 <= response.status_code <= 599:
+                raise ValueError(f"status_code: expected 200..599; actual {response.status_code}")
             # Reject NaN/Infinity in a peer's JSON as well.
             json.dumps(payload, allow_nan=False)
             return cls(response.status_code, payload, bytes(response.data), response.content_type)
         except (TypeError, ValueError) as exc:
-            raise BridgeError(502, "Invalid response from ROS2 service", outcome="unknown") from exc
+            raise BridgeError(502, f"Invalid response from ROS2 service: {exc}", outcome="unknown") from exc
 
 
+# TOOL EXTENSION: both HTTP and direct ROS callers must pass these checks.
 def validate_request(config, operation, resource_id, payload):
     if not isinstance(payload, dict):
         raise BridgeError(422, "Request payload must be a JSON object")
@@ -55,12 +62,15 @@ def validate_request(config, operation, resource_id, payload):
     cameras = {camera.id for camera in config.cameras}
     if operation in {"move_arm", "set_gripper"} and resource_id not in arms:
         raise BridgeError(404, f"Unknown arm: {resource_id}")
-    if operation in {"camera", "capture"} and resource_id not in cameras:
+    if operation in {"camera", "capture", "observation"} and resource_id not in cameras:
         raise BridgeError(404, f"Unknown camera: {resource_id}")
     from .workflow import BODIES, validate_workflow
     if operation in BODIES or operation in {'reset_arms', 'recover_arms'}:
         try:
             return validate_workflow(config, operation, resource_id, payload)
+        except ValidationError as exc:
+            raise BridgeError(422, "Request validation failed", details=[
+                {k: item[k] for k in ("loc", "msg", "type")} for item in exc.errors()]) from exc
         except ValueError as exc:
             raise BridgeError(422, str(exc)) from exc
     try:
@@ -78,10 +88,13 @@ def validate_request(config, operation, resource_id, payload):
             if resource_id:
                 raise BridgeError(422, "stop uses payload.arm_id, not resource_id")
             return body.model_dump()
-        if operation in {"state", "camera", "capture"}:
-            if payload or (operation == "state" and resource_id):
-                raise BridgeError(422, "Unexpected request fields")
+        if operation in {"state", "camera", "capture", "observation"}:
+            if payload:
+                raise BridgeError(422, f"{operation}: unexpected payload fields {sorted(payload)}")
+            if operation == "state" and resource_id:
+                raise BridgeError(422, f"state.resource_id: expected empty; actual {resource_id!r}")
             return payload
     except ValidationError as exc:
-        raise BridgeError(422, str(exc)) from exc
+        raise BridgeError(422, "Request validation failed", details=[
+            {k: item[k] for k in ("loc", "msg", "type")} for item in exc.errors()]) from exc
     raise BridgeError(404, f"Unknown operation: {operation}")

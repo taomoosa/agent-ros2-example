@@ -1,6 +1,10 @@
 """Test-only driver and fixtures. These never command physical hardware."""
 
 import asyncio
+import fcntl
+import os
+import tempfile
+import copy
 import io
 import json
 import struct
@@ -58,12 +62,18 @@ async def eventually(predicate, timeout=5.0):
 
 class FakeDriver(Node):
     def __init__(self, robot_config, **kwargs):
-        super().__init__("test_driver", **kwargs)
+        super().__init__("test_driver", **robot_config.server.node_options(kwargs))
         self.config = robot_config
         self.calls = []
         self.publish_images = True
         self.publish_states = True
         self.publish_geometry = True
+        self.depth_data = None
+        self.depth_offset_ns = 0
+        self.depth_delay_ticks = 0
+        self.geometry_queue = []
+        self.state_stamp_ns = None
+        self.skip_states = set()
         self.confirm_coordination = True
         self.wrist_offset = 1.0
         self.hold_moves = False
@@ -81,10 +91,10 @@ class FakeDriver(Node):
             CompressedImage, robot_config.camera_topic(camera.id), qos_profile_sensor_data)
             for camera in robot_config.cameras}
         self.info_publishers = {c.id: self.create_publisher(CameraInfo,
-            f'{robot_config.server.namespace}/cameras/{c.id}/camera_info', qos_profile_sensor_data)
+            robot_config.camera_info_topic(c.id), qos_profile_sensor_data)
             for c in robot_config.cameras}
         self.depth_publishers = {c.id: self.create_publisher(DepthImage,
-            f'{robot_config.server.namespace}/cameras/{c.id}/depth/aligned', qos_profile_sensor_data)
+            robot_config.camera_depth_topic(c.id), qos_profile_sensor_data)
             for c in robot_config.cameras}
         self.tf_broadcaster = TransformBroadcaster(self)
         self.images = {camera.id: jpeg("blue" if camera.arm_id else "red") for camera in robot_config.cameras}
@@ -97,7 +107,11 @@ class FakeDriver(Node):
         with self._lock:
             if self.publish_states:
                 for arm_id, publisher in self.state_publishers.items():
-                    publisher.publish(String(data=json.dumps(self.states[arm_id])))
+                    if arm_id in self.skip_states:
+                        continue
+                    state = self.states[arm_id]
+                    stamp = self.state_stamp_ns if self.state_stamp_ns is not None else self.get_clock().now().nanoseconds
+                    publisher.publish(String(data=json.dumps(dict(state, stamp_ns=stamp))))
             if self.publish_images:
                 for camera in self.config.cameras:
                     message = CompressedImage(format="jpeg", data=self.images[camera.id])
@@ -108,9 +122,16 @@ class FakeDriver(Node):
                         info = CameraInfo(header=message.header, width=48, height=32,
                             k=[100.,0.,24.,0.,100.,16.,0.,0.,1.])
                         depth = DepthImage(header=message.header, width=48, height=32,
-                            encoding='16UC1', step=96, data=struct.pack('<H', 1000)*48*32)
+                            encoding='16UC1', step=96, data=(self.depth_data if self.depth_data is not None
+                                else struct.pack('<H', 1000)*48*32))
+                        info.header = copy.deepcopy(message.header)
+                        depth.header = copy.deepcopy(message.header)
+                        info.header.frame_id = camera.camera_info_frame or camera.optical_frame
+                        depth.header.frame_id = camera.depth_frame or camera.optical_frame
+                        depth_ns = message.header.stamp.sec*1_000_000_000+message.header.stamp.nanosec+self.depth_offset_ns
+                        depth.header.stamp.sec, depth.header.stamp.nanosec = divmod(depth_ns, 1_000_000_000)
                         self.info_publishers[camera.id].publish(info)
-                        self.depth_publishers[camera.id].publish(depth)
+                        self.geometry_queue.append([self.depth_delay_ticks, camera.id, depth])
                         tf = TransformStamped()
                         tf.header.stamp = message.header.stamp
                         tf.header.frame_id = self.config.world_frame
@@ -121,6 +142,13 @@ class FakeDriver(Node):
                         if camera.arm_id:
                             tf.child_frame_id = camera.parent_frame
                             self.tf_broadcaster.sendTransform(tf)
+
+            for item in list(self.geometry_queue):
+                if item[0] <= 0:
+                    self.depth_publishers[item[1]].publish(item[2])
+                    self.geometry_queue.remove(item)
+                else:
+                    item[0] -= 1
 
     async def serve(self, request, response):
         with self._lock:
@@ -184,9 +212,23 @@ class FakeDriver(Node):
 class RosFixture:
     def __init__(self, robot_config):
         self.config = robot_config
+        self.config.server.settling_dwell = 0.
         self.context = Context()
-        # Each test context has a local discovery domain, independent of user robots.
-        rclpy.init(context=self.context, domain_id=173,
+        # Lease a domain across test processes; never share delayed responses.
+        self._domain_file = None
+        for domain in range(180, 230):
+            fd = os.open(f"{tempfile.gettempdir()}/agent-ros2-test-domain-{domain}.lock",
+                         os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                continue
+            self._domain_file = fd
+            break
+        if self._domain_file is None:
+            raise RuntimeError("No isolated ROS test domain available")
+        rclpy.init(context=self.context, domain_id=domain,
                    signal_handler_options=SignalHandlerOptions.NO)
         self.robot = RobotBridgeNode(robot_config, context=self.context)
         self.gateway = HttpGatewayNode(robot_config, context=self.context)
@@ -214,6 +256,7 @@ class RosFixture:
         for node in (self.driver, self.gateway, self.robot):
             node.destroy_node()
         self.context.try_shutdown()
+        os.close(self._domain_file)
         if self.thread.is_alive():
             raise AssertionError("ROS2 executor thread did not stop")
 

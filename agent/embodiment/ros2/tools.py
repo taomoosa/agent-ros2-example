@@ -3,6 +3,7 @@
 from embodiment.ros2.config import RobotConfig
 
 
+# TOOL EXTENSION: declare triggers/arguments here; see server/docs/extending.md.
 def ros2_tools(config: RobotConfig) -> list[dict]:
   arm = {"type": "STRING", "enum": [item.id for item in config.arms]}
   declarations = []
@@ -44,7 +45,7 @@ def ros2_tools(config: RobotConfig) -> list[dict]:
       "Only after success read state and detect a NEW plan. Attempts are limited per application; "
       "unsupported or unrecoverable faults require finish_task(success=false).", {}, blocking=True)
   add("detect_targets", "After startup/reset, successful recovery, or verified placement, ask Gemini Robotics ER for new grasp/release pixels. "
-      "ROS2 converts measured depth and capture-time TF into a plan. For a shared object include both arms in one plan.",
+      "ROS2 projects using measured depth/TF or the fixed camera calibrated plane. In plane mode select on-plane points only. For a shared object include both arms in one plan.",
       {"camera_id": camera, "instruction": text,
        "arm_ids": {"type": "ARRAY", "items": arm, "minItems": 1, "maxItems": len(config.arms)}},
       ("camera_id", "instruction", "arm_ids"), blocking=True)

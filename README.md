@@ -15,7 +15,7 @@ Gemini Live / application tasks --HTTP--> http_gateway node (FastAPI)
 
 ## Getting started
 
-The agent requires Python 3.10 or later. See [agent/README.md](agent/README.md)
+The agent requires Python 3.11 or later. See [agent/README.md](agent/README.md)
 for dependency installation. ROS2 does not need to be installed on the agent host.
 See [server/README.md](server/README.md) for server prerequisites, build commands,
 and startup instructions. Configure matching arm IDs, camera IDs, and coordinate
@@ -23,7 +23,8 @@ frames on both sides.
 
 The [hardware integration guide](server/docs/integration.md) lists what to
 configure and implement for the server and ROS2 driver, including a one-arm,
-one-fixed-camera setup. The [extension guide](server/docs/extending.md) maps new
+one-fixed-camera setup. [ROS topic/service overrides](server/docs/ros-names.md)
+are kept together in the configuration's `server.remappings` object. The [extension guide](server/docs/extending.md) maps new
 tools and ROS capabilities to the files, driver contracts and tests to update.
 
 ```bash
@@ -49,22 +50,26 @@ coordinated pick/place, and camera-image grasp verification. Describe the object
 and destination with `--instruction`; you do not need to supply Cartesian poses.
 Separate Gemini Robotics ER requests locate and refine pixel targets. The Live
 agent itself assesses grasp success from explicit post-pick camera images and
-arm state, then records its decision and reason with `verify_grasp`. Select its model
-with `--robotics-model` (default `gemini-robotics-er-2-preview`).
+arm state, then records its decision and reason with `verify_grasp`. Select the
+ER model with `--robotics-model` (default `gemini-robotics-er-2-preview`);
+`--model` selects the Live agent model.
 
-ROS2 projects the pixels using registered depth, camera calibration and TF at
-the image acquisition time. A dual-arm plan moves both arms through coordinated
+ROS2 projects pixels using registered depth and capture-time TF, or an offline
+calibrated plane for fixed cameras. [Plane projection](server/docs/plane-projection.md)
+uses `projection: "plane"` and needs no depth stream; its points must lie on the
+calibrated surface. `configs/planar.json` provides illustrative settings. A dual-arm plan moves both arms through coordinated
 phases in a single driver request per stage. The driver implements home poses,
 approach geometry, grasp orientation, motion planning and synchronized control.
 See [pixel workflow and driver contract](docs/pixel-workflow.md) for tools,
-prompts, required RGB-D/TF inputs and extension points. The
+prompts, depth/plane geometry inputs and extension points. The
 [tool lifecycle guide](docs/tool-lifecycle.md) explains triggers, fault detection,
 controlled recovery/retries and external ER prompt files. The
 [tool outcome guide](docs/tool-results.md) maps every tool to its completion
 evidence and scenario tests.
 
-The existing metric `move_arm`, `set_gripper`, and new `move_arms` tools remain
-available for measured/manual operations. They invalidate unfinished pixel plans.
+The metric `move_arm` / `move_arms` tools and `set_gripper` remain available
+for measured/manual operations. They invalidate unfinished pixel plans, but
+cannot discard a held-object plan; stop and recover before another motion.
 `finish_task` ends the application; a reported failure exits with status 1.
 An interrupted application, connection failure, or timeout triggers a stop
 request and connection cleanup. Motion requests are not automatically retried
@@ -115,3 +120,10 @@ copied files are unchanged.
 `agent/embodiment/ros2/`, `agent/run_ros2.py`, the ROS2-specific tests,
 configurations, application examples, `server/`, and project documentation were
 added in this repository and are provided under Apache License 2.0.
+
+Hardware integration updates include [camera synchronization and diagnostics](server/docs/synchronization.md)
+and [measured String/JSON telemetry](server/docs/telemetry.md).
+Search `HARDWARE INTEGRATION` and `TOOL EXTENSION` comments to find the relevant
+source boundaries. When the `RobotRequest` service definition changes, rebuild
+the ROS interface and its service consumers. State-only publishers use standard
+`std_msgs/msg/String` and do not depend on the custom service type.

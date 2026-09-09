@@ -46,13 +46,19 @@ The arm state topic optionally accepts:
 }
 ```
 
-This shows added fields; the existing `moving` and `flange_pose` fields are still
-required. Faults and object detection default to null when not supplied. Opening-
-only legacy state messages remain valid. `recoverable` defaults to false in an
+This is a partial field example, not a complete topic payload. The String JSON
+requires actual measurement `stamp_ns`, `moving`, `flange_pose` and a `gripper`
+object. Faults and object detection default to null; `gripper.opening` may also
+be null/omitted. A gripper object containing only `opening` remains valid, but
+older unstamped state payloads must be updated. See the
+[complete telemetry example](../server/docs/telemetry.md). `recoverable` defaults to false in an
 explicit fault. Missing sensor readings are not interpreted as successful grasps.
 
 The bridge checks arm/gripper faults before ordinary motion, during grasp
-verification, before placement, and again on ordinary successful command completion.
+verification, before placement, and on subsequent measured state after a
+successful driver motion response. All target arms must provide this state
+within the completion wait and original operation deadline; see
+[completion timing](../server/docs/telemetry.md#freshness-and-command-completion).
 A negative object-detection reading blocks a positive visual assessment and placement.
 The driver must still report phase failures promptly, stop the group after partial
 failure, and implement its hardware limits; the bridge cannot infer unreported
@@ -93,7 +99,9 @@ Use robot-specific recovery targets and limits. Return the normal coordinated
 completion acknowledgement only when the recovery has actually completed; publish
 cleared/current state. If this cannot be done, return a failure. The skeleton
 supplies the request/state machine and test driver, not a physical recovery planner.
-The deadline is 60 seconds; the agent's HTTP budget is 65 seconds.
+Default recovery budgets are 141 seconds in the bridge and 146 seconds in the
+agent, plus its preceding stop. Configure execution/settling/state/delivery
+allowances together; see [time budgets](../server/docs/time-budgets.md).
 
 ## One fixed camera and one arm
 
@@ -116,12 +124,17 @@ must be world-fixed or attached to that arm. The server accepts either type for
 post-pick verification and still checks capture time and arm identity. The fixed
 view must show the held object clearly; an occluded grasp is not presumed successful.
 
-The single camera must still provide the RGB-D capture contract: rectified JPEG,
-aligned measured depth, CameraInfo, and optical-to-world TF. A single RGB-D camera
-is sufficient; uncalibrated monocular RGB alone does not determine metric depth.
+By default, detection requires rectified JPEG, aligned depth, CameraInfo and
+optical-to-world TF. A fixed RGB camera can instead use an
+[offline plane calibration](../server/docs/plane-projection.md) when both targets
+lie on that plane. Uncalibrated monocular RGB alone does not determine metric depth.
 See [pixel geometry](pixel-workflow.md#capture-geometry). A compatible driver is
 needed for physical execution. The tests run this entire minimal workflow with
 real ROS2 communication and mocked Gemini/driver components.
+
+Grasp inspection uses RGB `/observation` evidence without depth or TF. Optional
+wrist cameras used only for inspection can therefore be RGB-only. See
+[camera contracts](../server/docs/synchronization.md).
 
 ## Customizing ER prompts without editing source
 

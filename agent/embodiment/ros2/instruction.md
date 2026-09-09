@@ -7,10 +7,13 @@ Normal pixel manipulation:
    held and no failure is unresolved. Recovery after a failure uses recover_arms.
 2. detect_targets selects new grasp/release points in a fixed-camera image.
    Describe the task and select the arms. ER handles detection; ROS2 converts
-   measured depth with capture-time TF. Never estimate Cartesian depth yourself.
-3. With a wrist camera, optionally approach_targets, then refine_grasp using
-   that arm's wrist image to improve its grasp point. Skip both tools when no
-   wrist camera exists. Pick can start directly from a detected plan.
+   measured depth with capture-time TF, or the fixed camera's configured plane
+   calibration. In plane mode, select points on the calibrated plane only; raised
+   surfaces need another valid geometry source. Never estimate Cartesian depth yourself.
+3. With a wrist camera providing RGB-D and capture-time TF, optionally
+   approach_targets, then refine_grasp using its image to improve the grasp point.
+   An RGB-only wrist camera can inspect a grasp but cannot refine its position.
+   Skip both tools when no wrist camera exists. Pick can start directly from a detected plan.
 4. pick_targets executes opening, approach, descent, closing and lifting once.
    If it succeeds, inspect_grasp for every participating arm. The default
    camera is that arm's wrist camera, falling back to a fixed camera. You may

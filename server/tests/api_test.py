@@ -32,7 +32,7 @@ class ApiTest(unittest.IsolatedAsyncioTestCase):
             "frame_id": "world", "position": [0, 0, 0], "orientation": [0, 0, 0, 1], "duration": 4})
         self.assertEqual(200, response.status_code)
         self.assertEqual(("move_arm", "arm"), self.gateway.calls[-1][:2])
-        self.assertEqual(9, self.gateway.calls[-1][3])
+        self.assertEqual(25, self.gateway.calls[-1][3])
         await self.client.post("/v1/arms/arm/gripper", json={"opening": 0.5})
         self.assertEqual("set_gripper", self.gateway.calls[-1][0])
         await self.client.post("/v1/stop", json={"arm_id": None})

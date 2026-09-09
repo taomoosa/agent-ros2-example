@@ -1,10 +1,12 @@
 """ROS2 topic aggregation and asynchronous forwarding to a robot driver."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import math
 import threading
 import time
+import uuid
+import re
 
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.clock import Clock, ClockType
@@ -17,6 +19,7 @@ from rclpy.time import Time
 from tf2_ros import Buffer, TransformListener, TransformException
 
 from .pixels import PixelPlans
+from .diagnostics import event, require
 from std_msgs.msg import String
 
 from .protocol import BridgeError, Reply, validate_request
@@ -31,15 +34,24 @@ class Pending:
     camera: tuple | None = None
     upstream: Future | None = None
     capture: bool = False
+    observation: bool = False
+    request_id: str = ""
+    started: float = field(default_factory=time.monotonic)
+    reason: dict = field(default_factory=dict)
+    check: object = None
 
 
 class RobotBridgeNode(Node):
     def __init__(self, config, **kwargs):
-        super().__init__("robot_bridge", **kwargs)
+        super().__init__("robot_bridge", **config.server.node_options(kwargs))
         self.config = config
         self.store = StateStore(config)
+        self._last_motion_end_ns = 0
         self.pixels = PixelPlans(config)
         self._calibration = {}
+        self._calibration_keys = {}
+        self._invalid_plane_cameras = set()
+        self._last_ros_ns = self.get_clock().now().nanoseconds
         self._depth = {}
         self._motion_busy = False
         self._motion_uncertain = False
@@ -71,13 +83,12 @@ class RobotBridgeNode(Node):
                 CompressedImage, config.camera_topic(camera.id),
                 lambda msg, camera_id=camera.id: self._image(camera_id, msg),
                 qos_profile_sensor_data, callback_group=self._group))
-            prefix = f"{config.server.namespace}/cameras/{camera.id}"
             self._topic_subscriptions.append(self.create_subscription(
-                CameraInfo, prefix + '/camera_info',
-                lambda msg, camera_id=camera.id: self._calibration.update({camera_id: msg}),
+                CameraInfo, config.camera_info_topic(camera.id),
+                lambda msg, camera_id=camera.id: self._camera_info(camera_id, msg),
                 qos_profile_sensor_data, callback_group=self._group))
             self._topic_subscriptions.append(self.create_subscription(
-                Image, prefix + '/depth/aligned',
+                Image, config.camera_depth_topic(camera.id),
                 lambda msg, camera_id=camera.id: self._depth_image(camera_id, msg),
                 qos_profile_sensor_data, callback_group=self._group))
         # Wall-time deadlines must also expire when simulated ROS time is paused.
@@ -86,18 +97,63 @@ class RobotBridgeNode(Node):
             clock=Clock(clock_type=ClockType.STEADY_TIME))
 
     def _arm_state(self, arm_id, message):
+        # HARDWARE INTEGRATION: publish measured JSON through standard String.
+        # See server/docs/telemetry.md for fields, timestamps and unavailable sensors.
         try:
-            self.store.update_arm(arm_id, json.loads(message.data))
+            payload = json.loads(message.data)
+            require(isinstance(payload, dict), "state", "JSON object", type(payload).__name__)
+            payload = dict(payload)
+            stamp = payload.pop("stamp_ns", None)
+            now = self.get_clock().now().nanoseconds
+            latest = now + round(self.config.server.future_skew_tolerance_sec*1e9)
+            require(type(stamp) is int and 0 < stamp <= latest, "state.stamp_ns", f"(0, {latest}]", stamp)
+            self.store.update_arm(arm_id, payload, stamp)
         except (TypeError, ValueError) as exc:
-            self.get_logger().warning(f"Ignoring invalid state for {arm_id}: {exc}")
+            self.get_logger().warning(f"Ignoring invalid state for {arm_id}: {exc}", throttle_duration_sec=1.)
+
+    def _invalidate_geometry(self):
+        self._recovery_required = self._recovery_required or self._motion_busy or any(
+            p['state'] in {'picked', 'verified', 'executing'} for p in self.pixels.plans.values())
+        if self._motion_busy:
+            self._motion_uncertain = True
+            self._generation += 1
+        self.pixels.invalidate()
+
+    def _camera_info(self, camera_id, message):
+        from .numerics import calibration_key, same_calibration
+        camera = next(c for c in self.config.cameras if c.id == camera_id)
+        key = calibration_key(message)
+        with self._lock:
+            previous = self._calibration_keys.get(camera_id)
+            changed = previous is None or not same_calibration(previous, key, camera)
+            if previous is not None and changed:
+                if next(c for c in self.config.cameras if c.id == camera_id).projection == 'plane':
+                    self._invalid_plane_cameras.add(camera_id)
+                self.store.clear_cameras(camera_id)
+                self._depth.pop(camera_id, None)
+                self._invalidate_geometry()
+                for pending in list(self._pending):
+                    if pending.camera and pending.camera[0] == camera_id:
+                        self._complete(pending, Reply.from_error(BridgeError(409, f"Calibration changed for {camera_id}; reacquire",
+                                                                            code="calibration_changed")))
+                event(self.get_logger(), "calibration_changed", level="warning", camera=camera_id)
+            if changed:
+                event(self.get_logger(), "calibration_received", camera=camera_id,
+                      frame=message.header.frame_id, width=message.width, height=message.height)
+                # Keep the accepted baseline: repeated sub-tolerance updates must
+                # not hide cumulative calibration drift.
+                self._calibration_keys[camera_id] = key
+                self._calibration[camera_id] = message
 
     def _image(self, camera_id, message):
         try:
             if "jpeg" not in message.format.lower():
                 raise ValueError("Expected a JPEG CompressedImage")
             stamp = message.header.stamp
-            self.store.update_camera(camera_id, bytes(message.data), message.header.frame_id,
-                                     stamp.sec * 1_000_000_000 + stamp.nanosec)
+            accepted = self.store.update_camera(camera_id, bytes(message.data), message.header.frame_id,
+                                                stamp.sec * 1_000_000_000 + stamp.nanosec)
+            event(self.get_logger(), "rgb_received", camera=camera_id, accepted=accepted,
+                  stamp_ns=stamp.sec*1_000_000_000+stamp.nanosec, frame=message.header.frame_id)
         except (TypeError, ValueError, OSError) as exc:
             self.get_logger().warning(f"Ignoring invalid image for {camera_id}: {exc}")
             return
@@ -107,89 +163,234 @@ class RobotBridgeNode(Node):
         stamp = message.header.stamp.sec*1_000_000_000 + message.header.stamp.nanosec
         cache = self._depth.setdefault(camera_id, {})
         cache[stamp] = message
-        while len(cache) > 16:
+        while len(cache) > self.config.server.camera_buffer_size:
             del cache[next(iter(cache))]
+        event(self.get_logger(), "depth_received", camera=camera_id, stamp_ns=stamp,
+              frame=message.header.frame_id, encoding=message.encoding)
         self._try_cameras()
 
     def _pose_at(self, frame_id, stamp_ns):
-        tf = self.tf_buffer.lookup_transform(self.config.world_frame, frame_id, Time(nanoseconds=stamp_ns)).transform
+        try:
+            tf = self.tf_buffer.lookup_transform(self.config.world_frame, frame_id, Time(nanoseconds=stamp_ns)).transform
+        except TransformException as exc:
+            raise TransformException(f"{self.config.world_frame} <- {frame_id} at {stamp_ns}: {exc}") from exc
         return dict(frame_id=self.config.world_frame,
                     position=[tf.translation.x, tf.translation.y, tf.translation.z],
                     orientation=[tf.rotation.x, tf.rotation.y, tf.rotation.z, tf.rotation.w])
 
+    def _waiting(self, pending, code, **details):
+        reason = dict(code=code, **details)
+        # Timer retries do not flood logs with the same wait condition.
+        if pending.reason.get('code') != code:
+            event(self.get_logger(), "request_wait", request_id=pending.request_id, **reason)
+        pending.reason = reason
+
     def _try_cameras(self):
         with self._lock:
+            now = self.get_clock().now().nanoseconds
+            latest = now + round(self.config.server.future_skew_tolerance_sec*1e9)
             for pending in list(self._pending):
-                if pending.camera is None:
+                if pending.camera is None or time.monotonic() >= pending.deadline:
                     continue
-                camera_id = pending.camera[0]
-                frame = self.store.fresh_camera(*pending.camera)
-                if frame is None:
+                camera_id, sequence, after_stamp = pending.camera
+                frames = [f for f in self.store.fresh_cameras(*pending.camera)
+                          if f.stamp_ns <= latest and now-f.stamp_ns <= self.config.server.camera_max_age*1e9]
+                if not frames:
+                    current = self.store._cameras.get(camera_id)
+                    self._waiting(pending, "fresh_rgb_unavailable", camera=camera_id,
+                                  after_stamp_ns=after_stamp, latest_stamp_ns=current.stamp_ns if current else None)
                     continue
                 if not pending.capture:
-                    self._complete(pending, Reply(
-                        payload={"frame_id": frame.frame_id, "stamp_ns": frame.stamp_ns},
-                        data=frame.data, content_type="image/jpeg"))
-                    continue
-                info = self._calibration.get(camera_id)
-                depth = self._depth.get(camera_id, {}).get(frame.stamp_ns)
-                if info is None or depth is None:
+                    frame = frames[-1]
+                    if pending.observation:
+                        self._complete(pending, Reply(payload=self.pixels.observe(camera_id, frame)))
+                    else:
+                        self._complete(pending, Reply(payload={"frame_id": frame.frame_id, "stamp_ns": frame.stamp_ns},
+                                                      data=frame.data, content_type="image/jpeg"))
                     continue
                 camera = next(c for c in self.config.cameras if c.id == camera_id)
-                try:
-                    camera_pose = self._pose_at(frame.frame_id, frame.stamp_ns)
-                    flange_pose = (self._pose_at(camera.parent_frame, frame.stamp_ns)
-                                   if camera.mount == 'flange' else None)
-                    metadata = self.pixels.capture(camera_id, frame, info, depth, camera_pose, flange_pose)
-                except TransformException:
+                if camera.projection == 'plane':
+                    if camera_id in self._invalid_plane_cameras:
+                        self._complete(pending, Reply.from_error(BridgeError(409,
+                            f"Plane calibration invalidated for {camera_id}; recalibrate and restart the bridge",
+                            code="plane_calibration_invalidated")))
+                        continue
+                    try:
+                        metadata = self.pixels.capture_plane(camera_id, frames[-1])
+                    except ValueError as exc:
+                        self._complete(pending, Reply.from_error(BridgeError(422, str(exc), code="capture_geometry_invalid")))
+                    else:
+                        self._complete(pending, Reply(payload=metadata))
                     continue
-                except ValueError as exc:
-                    self._complete(pending, Reply.from_error(BridgeError(422, str(exc))))
+                info = self._calibration.get(camera_id)
+                if info is None:
+                    self._waiting(pending, "camera_info_unavailable", camera=camera_id)
                     continue
-                self._complete(pending, Reply(payload=metadata))
+                camera = next(c for c in self.config.cameras if c.id == camera_id)
+                depths = self._depth.get(camera_id, {})
+                tolerance = round(camera.sync_tolerance_sec*1e9)
+                # Select the closest AVAILABLE pair; ties use earliest RGB/depth stamps.
+                # Both images must be acquired after the request; all queues are bounded.
+                pairs = sorted((abs(stamp-f.stamp_ns), f.stamp_ns, stamp, f.sequence, f, depth)
+                               for f in frames for stamp, depth in depths.items()
+                               if after_stamp <= stamp <= latest and now-stamp <= self.config.server.camera_max_age*1e9
+                               and abs(stamp-f.stamp_ns) <= tolerance)
+                if not pairs:
+                    self._waiting(pending, "depth_unavailable" if not depths else "depth_sync_unavailable",
+                                  camera=camera_id, rgb_stamp_ns=frames[-1].stamp_ns,
+                                  latest_depth_stamp_ns=max(depths, default=None), tolerance_ns=tolerance,
+                                  depth_cache_count=len(depths))
+                    continue
+                for delta, _, _, _, frame, depth in pairs:
+                    if time.monotonic() >= pending.deadline:
+                        break
+                    if delta and camera.mount == 'flange':
+                        try:
+                            state = self.store.state(now)
+                            arm = next(a for a in state['arms'] if a['id'] == camera.arm_id)
+                            if (self._motion_busy or arm['moving']
+                                    or min(frame.stamp_ns, depth.header.stamp.sec*1_000_000_000+depth.header.stamp.nanosec) <= self._last_motion_end_ns
+                                    or not self.store.stationary_interval(camera.arm_id,
+                                        min(frame.stamp_ns, depth.header.stamp.sec*1_000_000_000+depth.header.stamp.nanosec),
+                                        max(frame.stamp_ns, depth.header.stamp.sec*1_000_000_000+depth.header.stamp.nanosec))):
+                                self._waiting(pending, "wrist_not_stationary", camera=camera_id, arm_id=camera.arm_id)
+                                continue
+                        except BridgeError as exc:
+                            self._waiting(pending, "wrist_state_unavailable", camera=camera_id, detail=str(exc))
+                            continue
+                    try:
+                        camera_pose = self._pose_at(frame.frame_id, frame.stamp_ns)
+                        flange_pose = (self._pose_at(camera.parent_frame, frame.stamp_ns)
+                                       if camera.mount == 'flange' else None)
+                        metadata = self.pixels.capture(camera_id, frame, info, depth, camera_pose, flange_pose)
+                    except TransformException as exc:
+                        self._waiting(pending, "capture_tf_unavailable", camera=camera_id,
+                                      stamp_ns=frame.stamp_ns, detail=str(exc))
+                        continue
+                    except ValueError as exc:
+                        self._complete(pending, Reply.from_error(BridgeError(422, str(exc), code="capture_geometry_invalid")))
+                        break
+                    self._complete(pending, Reply(payload=metadata))
+                    break
 
     def _complete(self, pending, reply):
         with self._lock:
             if pending not in self._pending:
                 return
+            if reply.status < 400 and time.monotonic() >= pending.deadline:
+                reply = Reply.from_error(BridgeError(504, "Response arrived after deadline",
+                    code="capture_timeout" if pending.camera else "request_timeout",
+                    outcome=None if pending.camera else "unknown", details=pending.reason))
             self._pending.remove(pending)
+            if pending.upstream is not None and not pending.upstream.done():
+                self.driver.remove_pending_request(pending.upstream)
+                pending.upstream.cancel()
+            event(self.get_logger(), "request_complete", level="warning" if reply.status >= 400 else "debug",
+                  request_id=pending.request_id, status=reply.status,
+                  elapsed_ms=round((time.monotonic()-pending.started)*1000, 3),
+                  reason=pending.reason, capture_id=reply.payload.get("capture_id"))
             if not pending.future.done():
                 pending.future.set_result(reply)
 
     def _expire(self):
+        now = self.get_clock().now().nanoseconds
+        if now < self._last_ros_ns:
+            with self._lock:
+                self._invalidate_geometry()
+                self.store.reset()
+                self._depth.clear()
+                self.tf_buffer.clear()
+                for pending in list(self._pending):
+                    self._complete(pending, Reply.from_error(BridgeError(409, "ROS clock moved backwards; reacquire state and images",
+                                                                        code="clock_reset", outcome="unknown")))
+            event(self.get_logger(), "clock_reset", level="warning", previous_ns=self._last_ros_ns, now_ns=now)
+        self._last_ros_ns = now
         self._try_cameras()
         with self._lock:
             for pending in list(self._pending):
+                if time.monotonic() < pending.deadline and pending.check is not None and pending.check():
+                    self._complete(pending, Reply())
+                    continue
                 if time.monotonic() >= pending.deadline:
                     if pending.upstream is not None:
                         self.driver.remove_pending_request(pending.upstream)
                         pending.upstream.cancel()
                     self._complete(pending, Reply.from_error(BridgeError(
-                        504, "Fresh synchronized image, depth, calibration or capture-time TF unavailable" if pending.camera else "Driver command timed out",
-                        outcome=None if pending.camera else "unknown")))
+                        504, "Fresh image or configured projection inputs unavailable" if pending.camera else "Driver command timed out",
+                        outcome=None if pending.camera else "unknown", code="capture_timeout" if pending.camera else "request_timeout",
+                        details=pending.reason)))
 
-    async def _camera(self, camera_id, timeout, *, capture=False):
+    async def _camera(self, camera_id, timeout, *, capture=False, observation=False, request_id=""):
         with self._lock:
             if self._closing:
                 raise BridgeError(503, "Robot bridge is shutting down")
             pending = Pending(
                 Future(executor=self.executor), time.monotonic() + timeout,
                 camera=(camera_id, self.store.sequence(camera_id), self.get_clock().now().nanoseconds),
-                capture=capture)
+                capture=capture, observation=observation, request_id=request_id)
             self._pending.append(pending)
+        event(self.get_logger(), "camera_wait_started", request_id=request_id, camera=camera_id,
+              mode="capture" if capture else "observation" if observation else "image",
+              after_stamp_ns=pending.camera[2], sequence=pending.camera[1], timeout_sec=timeout)
         return await pending.future
 
-    async def _command(self, operation, resource_id, payload, timeout):
+    async def _wait_state(self, arm_ids, deadline, request_id, generation):
+        stamp = self.get_clock().now().nanoseconds
+        revisions = self.store.arm_revisions(arm_ids)
+        stable = [None, None, None]
+        def settled():
+            if generation != self._generation:
+                return True
+            if not self.store.measured_after(arm_ids, stamp, revisions):
+                return False
+            try:
+                state = self.store.state(self.get_clock().now().nanoseconds)
+            except BridgeError:
+                stable[:] = [None, None, None]
+                return False
+            arms = [a for a in state['arms'] if a['id'] in arm_ids]
+            if any(a.get('fault') or a['gripper'].get('fault') for a in arms):
+                return True  # The health check reports the actual fault.
+            if any(a['moving'] for a in arms):
+                stable[:] = [None, None, None]
+                return False
+            now = time.monotonic()
+            if stable[0] is None:
+                stable[:] = [now, self.store.arm_revisions(arm_ids), {a['id']:a['measurement_stamp_ns'] for a in arms}]
+            if self.config.server.settling_dwell and any(not self.store.stationary_interval(
+                    a['id'], stable[2][a['id']], a['measurement_stamp_ns']) for a in arms):
+                stable[:] = [None, None, None]
+                return False
+            return (now-stable[0] >= self.config.server.settling_dwell and
+                    (self.config.server.settling_dwell == 0 or
+                     all(self.store.arm_revisions(arm_ids)[a] > stable[1][a] for a in arm_ids)))
+        pending = Pending(Future(executor=self.executor), min(deadline, time.monotonic()+self.config.server.state_completion_timeout),
+                          request_id=request_id, reason=dict(code="post_command_state", arm_ids=arm_ids, after_stamp_ns=stamp),
+                          check=settled)
+        with self._lock:
+            self._pending.append(pending)
+        reply = await pending.future
+        if reply.status != 200:
+            raise BridgeError(reply.status, "No new measured state after driver completion", outcome="unknown",
+                              code="post_command_state_timeout", details=pending.reason)
+
+    async def _command(self, operation, resource_id, payload, timeout, request_id=""):
+        # HARDWARE INTEGRATION: implement the driver service, not this common guard.
+        # TOOL EXTENSION: classify new motions in _workflow; see server/docs/extending.md.
+        if timeout <= 0:
+            raise BridgeError(504, "Driver deadline already expired", outcome="not_started")
+        event(self.get_logger(), "driver_send", request_id=request_id, operation=operation, resource=resource_id)
         with self._lock:
             if self._closing:
                 raise BridgeError(503, "Robot bridge is shutting down")
             if not self.driver.service_is_ready():
                 raise BridgeError(503, "Robot driver service is unavailable")
             request = RobotRequest.Request(
-                operation=operation, resource_id=resource_id,
-                payload_json=json.dumps(payload, allow_nan=False), timeout_sec=timeout)
+                request_id=request_id, operation=operation, resource_id=resource_id,
+                payload_json=json.dumps(payload, allow_nan=False), timeout_sec=timeout,
+                deadline_ns=self.get_clock().now().nanoseconds+round(timeout*1e9))
             upstream = self.driver.call_async(request)
-            pending = Pending(Future(executor=self.executor), time.monotonic() + timeout, upstream=upstream)
+            pending = Pending(Future(executor=self.executor), time.monotonic() + timeout, upstream=upstream, request_id=request_id)
             self._pending.append(pending)
 
         def done(future):
@@ -225,31 +426,60 @@ class RobotBridgeNode(Node):
         return self._idle.wait(timeout)
 
     async def _request(self, request, response):
+        trace = request.request_id if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", request.request_id) else uuid.uuid4().hex
+        event(self.get_logger(), "bridge_received", request_id=trace, operation=request.operation, resource=request.resource_id)
+        admitted = None
         try:
-            if not math.isfinite(request.timeout_sec) or not 0 < request.timeout_sec <= 65:
-                raise BridgeError(422, "timeout_sec must be finite and in (0, 65]")
+            if not math.isfinite(request.timeout_sec) or not 0 < request.timeout_sec <= 15000:
+                raise BridgeError(422, "timeout_sec must be finite and in (0, 15000]")
+            budget = request.timeout_sec
+            if request.deadline_ns:
+                budget = min(budget, (request.deadline_ns-self.get_clock().now().nanoseconds)/1e9)
+            if budget <= 0:
+                raise BridgeError(504, "Request expired before execution", code="request_expired", outcome="not_started")
+            admitted = time.monotonic()+budget
             try:
                 payload = json.loads(request.payload_json)
             except ValueError as exc:
                 raise BridgeError(422, "Invalid JSON request payload") from exc
             payload = validate_request(self.config, request.operation, request.resource_id, payload)
+            budget = admitted-time.monotonic()
+            if budget <= 0:
+                raise BridgeError(504, "Request expired during validation", code="request_expired", outcome="not_started")
             if request.operation == "state":
                 state = self.store.state(self.get_clock().now().nanoseconds)
                 state.update(recovery_required=self._recovery_required, motion_outcome_unknown=self._motion_uncertain)
                 reply = Reply(payload=state)
-            elif request.operation in {"camera", "capture"}:
-                reply = await self._camera(request.resource_id, min(request.timeout_sec, self.config.server.camera_timeout),
-                                           capture=request.operation == "capture")
+            elif request.operation in {"camera", "capture", "observation"}:
+                reply = await self._camera(request.resource_id, min(budget, self.config.server.camera_timeout),
+                                           capture=request.operation == "capture", observation=request.operation == "observation", request_id=trace)
             else:
-                reply = await self._workflow(request.operation, request.resource_id, payload, request.timeout_sec)
+                reply = await self._workflow(request.operation, request.resource_id, payload, budget, request_id=trace)
         except BridgeError as exc:
             reply = Reply.from_error(exc)
+            event(self.get_logger(), "bridge_rejected", level="warning", request_id=trace,
+                  status=exc.status, detail=str(exc))
+        except ValueError as exc:
+            reply = Reply.from_error(BridgeError(422, str(exc), code="invalid_input"))
+            event(self.get_logger(), "bridge_rejected", level="warning", request_id=trace,
+                  status=422, detail=str(exc))
         except Exception as exc:
             self.get_logger().error(f"Request failed: {exc}")
             reply = Reply.from_error(BridgeError(500, "Robot bridge request failed", outcome="unknown"))
+        if reply.status < 400 and admitted is not None and time.monotonic() >= admitted:
+            if request.operation in {'move_arm', 'move_arms', 'set_gripper', 'execute_plan', 'reset_arms', 'recover_arms', 'stop'}:
+                self._motion_uncertain = self._recovery_required = True
+                self._all_stopped = False
+                self.pixels.invalidate()
+            reply = Reply.from_error(BridgeError(504, "Request completed after deadline", code="request_timeout", outcome="unknown"))
+        event(self.get_logger(), "bridge_reply", request_id=trace, status=reply.status)
         return reply.to_ros(response)
 
-    async def _workflow(self, operation, resource_id, payload, timeout):
+    async def _workflow(self, operation, resource_id, payload, timeout, request_id=""):
+        # TOOL EXTENSION: read-only operations need an explicit branch before motion admission.
+        deadline = time.monotonic()+timeout
+        event(self.get_logger(), "workflow_enter", request_id=request_id, operation=operation,
+              generation=self._generation, busy=self._motion_busy, recovery=self._recovery_required)
         if operation == 'stop':
             self._generation += 1
             self._recovery_required = self._recovery_required or self._motion_busy or any(
@@ -259,7 +489,7 @@ class RobotBridgeNode(Node):
             self._motion_uncertain = True
             self._all_stopped = False
             generation = self._generation
-            reply = await self._command(operation, resource_id, payload, timeout)
+            reply = await self._command(operation, resource_id, payload, max(0., deadline-time.monotonic()), request_id=request_id)
             if generation != self._generation:
                 return Reply.from_error(BridgeError(409, 'Stop superseded by another stop', outcome='unknown'))
             if reply.status == 200 and reply.payload.get('success') is True:
@@ -329,7 +559,12 @@ class RobotBridgeNode(Node):
         self._all_stopped = False
         completed_successfully = False
         try:
-            reply = await self._command(operation, resource_id, payload, timeout)
+            remaining = deadline-time.monotonic()
+            reserve = min(self.config.server.state_completion_timeout+self.config.server.bridge_processing_margin,
+                          remaining*.25)
+            if remaining <= 0:
+                raise BridgeError(504, "Motion expired before driver dispatch", code="request_expired", outcome="not_started")
+            reply = await self._command(operation, resource_id, payload, remaining-reserve, request_id=request_id)
             if generation != self._generation:
                 return Reply.from_error(BridgeError(409, 'Motion interrupted; outcome requires inspection', outcome='unknown'))
             self._motion_uncertain = reply.status >= 500 or reply.payload.get('outcome') == 'unknown'
@@ -341,6 +576,9 @@ class RobotBridgeNode(Node):
                     self._motion_uncertain = True
                     return Reply.from_error(BridgeError(502, 'Driver did not confirm coordinated completion for every arm', outcome='unknown'))
             if reply.status == 200 and reply.payload.get('success') is True:
+                await self._wait_state(arm_ids, deadline, request_id, generation)
+                if generation != self._generation:
+                    raise BridgeError(409, "Motion superseded while waiting for measured state", outcome="unknown")
                 self._check_health(arm_ids, expect_released=(operation == 'recover_arms' or
                     operation == 'execute_plan' and payload['stage'] == 'place'))
             completed_successfully = reply.status == 200 and reply.payload.get('success') is True
@@ -352,8 +590,15 @@ class RobotBridgeNode(Node):
                 plan['motion_stamp_ns'] = self.get_clock().now().nanoseconds
                 reply.payload.update(self.pixels.public(plan))
             return reply
+        except BridgeError as exc:
+            if generation == self._generation and exc.payload.get('outcome') == 'unknown':
+                self._motion_uncertain = True
+            raise
         finally:
+            event(self.get_logger(), "workflow_finished", request_id=request_id, operation=operation,
+                  success=completed_successfully, generation=self._generation)
             self._motion_busy = False
+            self._last_motion_end_ns = self.get_clock().now().nanoseconds
             if not completed_successfully:
                 self._recovery_required = True
             if plan is not None and plan['state'] == 'executing':

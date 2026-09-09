@@ -23,7 +23,8 @@ processes.
 For your first hardware installation, follow the
 [integration guide](docs/integration.md): it identifies the configuration,
 telemetry/camera adapters and driver operations you must supply, with a minimal
-configuration and bring-up checks. When adding a capability, use the
+configuration and bring-up checks. For a fixed camera with unreliable depth,
+[plane projection](docs/plane-projection.md) can use an offline calibration. When adding a capability, use the
 [extension guide](docs/extending.md) for the exact server/agent files to change,
 validation and motion lifecycle requirements, and tests to extend.
 
@@ -55,7 +56,7 @@ HTTP listens on `127.0.0.1:8080` by default. Interactive API documentation is
 available at `/docs`. To connect an agent from another host, configure `--host`
 and the agent's `robot_url`.
 
-`--config` accepts the included minimal, single-arm or dual-arm configuration, or an agent
+`--config` accepts the included minimal, planar, single-arm or dual-arm configuration, or an agent
 configuration in the same format. The server accepts `robot_url` for
 compatibility, but its listen address is determined by `--host` and `--port`.
 
@@ -72,32 +73,44 @@ An optional `server` object in the configuration can override these defaults:
 {
   "namespace": "/robotics",
   "driver_service": "/robot_driver/execute",
+  "remappings": {},
   "state_max_age": 2.0,
-  "camera_timeout": 1.5
+  "camera_timeout": 5.0,
+  "camera_buffer_size": 32,
+  "camera_max_age": 2.0,
+  "state_completion_timeout": 5.0
 }
 ```
 
-Omitting the `server` object uses the values above. Standard ROS2 topic remapping
-is also supported. Arm and camera IDs become topic name segments, so use ASCII
+Omitting the `server` object uses the values above. Put installation-specific
+topic and service overrides in `server.remappings`; both nodes read this one
+map. See [central ROS name configuration](docs/ros-names.md) and the complete
+[remapped example](configs/remapped.json). Standard ROS2 CLI remapping remains
+supported and overrides matching JSON rules. Arm and camera IDs become topic name segments, so use ASCII
 letters, digits, and underscores, starting with a letter or underscore.
 
 ## ROS2 connections
 
+The following are default names before `server.remappings` is applied.
+
 | Connection | Type | Content |
 |---|---|---|
-| Subscribe to `/robotics/arms/{arm_id}/state` | `std_msgs/msg/String` | Arm state JSON shown below |
+| Subscribe to `/robotics/arms/{arm_id}/state` | `std_msgs/msg/String` | Measured JSON arm state; [migration and fields](docs/telemetry.md) |
 | Subscribe to `/robotics/cameras/{camera_id}/image/compressed` | `sensor_msgs/msg/CompressedImage` | JPEG, optical frame, and acquisition timestamp |
 | Subscribe to `/robotics/cameras/{camera_id}/camera_info` | `sensor_msgs/msg/CameraInfo` | Rectified calibration matching the JPEG geometry |
-| Subscribe to `/robotics/cameras/{camera_id}/depth/aligned` | `sensor_msgs/msg/Image` | Measured depth aligned to RGB with the same acquisition timestamp |
+| Subscribe to `/robotics/cameras/{camera_id}/depth/aligned` | `sensor_msgs/msg/Image` | Color-grid/color-Z depth with configured header frame and timestamp tolerance |
 | Listen to `/tf` and `/tf_static` | TF messages | Camera-to-world and, for wrist cameras, flange-to-world transforms at acquisition time |
 | Serve `/robotics/request` | `ros2_agent_interfaces/srv/RobotRequest` | State, image, and command requests from the HTTP gateway |
 | Call `/robot_driver/execute` | `ros2_agent_interfaces/srv/RobotRequest` | Commands for a hardware-specific driver |
 
-Publish the following JSON object in the `data` field of each arm's state topic
-at regular intervals:
+Publish measured JSON in standard String messages periodically; [telemetry.md](docs/telemetry.md)
+explains required measurement timestamps, unavailable readings and publisher
+updates. Publish this JSON shape in `String.data`, replacing the illustrative
+`stamp_ns` with the actual measurement time in the shared ROS clock:
 
 ```json
 {
+  "stamp_ns": 123000000456,
   "moving": false,
   "flange_pose": {
     "frame_id": "world",
@@ -111,20 +124,24 @@ at regular intervals:
 The HTTP gateway client and bridge service use reliable, volatile service QoS
 with history depth 64 to accommodate concurrent image-request bursts.
 State subscriptions use reliable QoS with depth 1. Image subscriptions use
-sensor-data QoS with best-effort reliability. `/v1/state` returns 503 if any arm
-has no state or its last update was received more than `state_max_age` seconds
-ago. State freshness is measured from receipt time; drivers must publish current
-state.
+sensor-data QoS with best-effort reliability. `/v1/state` returns 503 if any arm has no valid state or its measurement or
+receipt age exceeds `state_max_age`. Replayed measurement stamps cannot refresh
+state. After a successful driver motion response, every participating arm must
+provide a subsequent sample measured at or after acknowledgement receipt, and
+pass stationary/fault checks. Stop relies on driver completion without this
+telemetry wait. See [completion timing](docs/telemetry.md#freshness-and-command-completion).
 
 An image's `format` must be `jpeg` or a compressed transport format identifying
 JPEG. Its `header.frame_id` must match the configured `optical_frame`, and
 `header.stamp` must contain the acquisition time. The server returns only images
 received after the HTTP request and captured at or after that request.
-Publishers and the server must use the same ROS clock, and timestamps must
-increase monotonically for each camera. Invalid JPEGs, incorrect frames, and
-old or duplicate timestamps are rejected. If no fresh image arrives, the server
-returns 504 rather than a cached image. Captures across cameras are not strictly
-synchronized.
+Publishers and the server must use the same ROS clock. Bounded image/depth
+buffers handle out-of-order delivery, while duplicate RGB stamps are ignored.
+Frames must satisfy request-time freshness and maximum age. If no fresh image
+arrives, the server returns 504 rather than a cached image. Captures across
+cameras are not strictly synchronized. See [synchronization and diagnostic
+configuration](docs/synchronization.md) for tolerance, frame aliases, TF history
+and the depth-free `/observation` endpoint.
 
 ## Internal service and driver interface
 
@@ -133,10 +150,12 @@ request and response type.
 
 | Request field | Meaning |
 |---|---|
-| `operation` | `state`, `camera`, `capture`, `move_arm`, `set_gripper`, `stop`, `create_plan`, `refine_plan`, `execute_plan`, `verify_grasp`, `reset_arms`, `move_arms`, `recover_arms` |
-| `resource_id` | Camera ID for camera/capture requests; arm ID for move/gripper requests; empty for state, stop and workflow operations |
+| `request_id` | Correlates HTTP, gateway, bridge and driver logs; rebuild all service consumers after updating the interface |
+| `operation` | `state`, `camera`, `capture`, `observation`, `move_arm`, `set_gripper`, `stop`, `create_plan`, `refine_plan`, `execute_plan`, `verify_grasp`, `reset_arms`, `move_arms`, `recover_arms` |
+| `resource_id` | Camera ID for camera/capture/observation requests; arm ID for move/gripper requests; empty for state, stop and workflow operations |
 | `payload_json` | Gateway-to-bridge: validated HTTP fields. Bridge-to-driver: command payload, enriched with targets/phases/arm IDs as applicable; see the [driver operation map](docs/integration.md#3-implement-the-hardware-driver-adapter) |
-| `timeout_sec` | Response deadline in seconds, greater than 0 and at most 65 |
+| `deadline_ns` | Shared ROS-clock deadline; zero for direct legacy callers. Rebuild every interface consumer |
+| `timeout_sec` | Response deadline in seconds, greater than 0 and at most 15000 |
 
 | Response field | Meaning |
 |---|---|
@@ -158,20 +177,38 @@ For `move_arm`, `set_gripper` and `stop`, return `status_code=200` and
 exactly once, even for a single arm.
 Report failure with `{"success": false, "error": "..."}` or a 4xx/5xx status.
 Responses that indicate acceptance without completion, such as 202, are
-converted to 502. Timeouts return 504 with `outcome: "unknown"`. Requests are not
+converted to 502. Motion timeouts, including missing post-command telemetry,
+return 504 with `outcome: "unknown"`. Camera input timeouts instead report
+`code: "capture_timeout"` and the missing-input details. Requests are not
 automatically retried. Cancelling a service wait does not stop physical motion;
 the driver must handle stop requests separately.
 
 Hardware-specific MoveIt, action, and controller integrations are not
 included. Capture-time TF lookup and RGB-D projection are implemented by the bridge. The driver is responsible for transforming flange targets, planning,
-collision checks, speed and force limits, and stopping active motion. Commands
-return 503 when no driver service is connected. The test driver in
+collision checks, speed and force limits, and stopping active motion. Physical
+commands return 503 when no driver service is connected. The test driver in
 `tests/helpers.py` is not used by the runtime nodes.
 
 The [tool lifecycle guide](../docs/tool-lifecycle.md) defines recovery after
 failed motion, optional arm/gripper faults and object-detection telemetry, and
 the one-fixed-camera configuration `configs/minimal.json`. Recovery is a
 separate coordinated driver operation; returning home alone is not recovery.
+
+## Processing time and standard camera input
+
+Configure operation, settling, state and delivery allowances in the shared JSON;
+see [time budgets and completion integration](docs/time-budgets.md). Stop has an
+independent deadline. The agent stops before cleanup on interruption and enforces
+elapsed deadlines even with mock transports. See [CameraInfo modes](docs/camera-info.md)
+for standard rectified P and the legacy rectified-K adapter contract.
+
+## Numerical acceptance
+
+See [numerical tolerances](docs/numerical-tolerances.md) for configurable camera
+calibration, RGB/depth timing, clock-skew and depth-quality limits. The default
+pairing tolerance is now 10 ms; set it to zero for strictly synchronized inputs.
+Depth projection now rejects unsupported local depth and values outside the
+configured range, so review these settings when connecting hardware.
 
 ## Tests
 

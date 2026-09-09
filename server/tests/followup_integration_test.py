@@ -105,7 +105,7 @@ class FollowupIntegrationTest(unittest.IsolatedAsyncioTestCase):
         try:
             await fixture.ready()
             entered, release = asyncio.Event(), asyncio.Event()
-            async def command(operation,resource,payload,timeout):
+            async def command(operation,resource,payload,timeout, **kwargs):
                 if payload['arm_id'] is None:
                     entered.set()
                     await release.wait()

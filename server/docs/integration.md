@@ -11,7 +11,7 @@ All commands below run from the repository root in that environment.
 | HTTP gateway and ROS bridge | FastAPI routes, asynchronous ROS requests, input validation, state cache, capture and plan lifecycle | Usually no source changes when hardware conforms to the existing contract |
 | Robot topology | [Minimal](../configs/minimal.json), [single-arm](../configs/single_arm.json), [dual-arm](../configs/dual_arm.json) examples | Set arm/camera IDs and frames to match your installation; use matching topology in the agent |
 | Arm telemetry | Validated JSON subscription per arm | Publish current controller/gripper state through an adapter |
-| Camera inputs | JPEG, CameraInfo and aligned-depth subscriptions; capture-time TF lookup | Provide correctly registered RGB-D, calibration, timestamps and TF; adapt camera output if necessary |
+| Camera inputs | JPEG, depth/CameraInfo/TF capture, or configured fixed-plane projection | Supply registered RGB-D and image-time TF for depth mode; for plane mode, supply the calibrated JPEG stream and offline coefficients |
 | Hardware commands | `RobotRequest` client and completion/failure checks | Implement a driver adapter service that calls your existing controllers, actions or MoveIt integration |
 | Physical manipulation | Group requests and phase descriptions | Implement home poses, TCP geometry, grasp orientation, clearances, limits, collision checking, synchronized execution and recovery in your driver |
 | Tests | Mock driver/Gemini with real ROS2 communication | Add tests for your adapter and validate its physical behavior on your system |
@@ -20,7 +20,9 @@ The runtime does not start a hardware driver. [FakeDriver](../tests/helpers.py)
 is a test fixture, not a production driver or a hardware simulator launched by
 the server. Keep robot-specific integration in a separate ROS package whenever
 it can implement the existing topics and service. Tool extensions are covered
-in [Adding tools and ROS capabilities](extending.md).
+in [Adding tools and ROS capabilities](extending.md). Measured String/JSON state and
+publisher updates are covered in [telemetry](telemetry.md); camera pairing, geometry
+aliases and diagnostic logs are covered in [synchronization](synchronization.md).
 
 ## 1. Set the topology and connection settings
 
@@ -40,7 +42,7 @@ For one fixed camera and one arm, start with this complete configuration:
     "namespace": "/robotics",
     "driver_service": "/robot_driver/execute",
     "state_max_age": 2.0,
-    "camera_timeout": 1.5
+    "camera_timeout": 5.0
   }
 }
 ```
@@ -53,11 +55,22 @@ The `server` object is optional. The agent can load the same topology file.
 | `world_frame`, arm frames | Match your TF/controller frames; positions use metres and orientations use unit quaternions in `[x,y,z,w]` order |
 | Arm and camera `id` | Use consistent IDs in agent configuration, topics and driver responses; valid ROS name segments only, without dots or hyphens |
 | Camera `mount` / `parent_frame` | Fixed: `world` and the configured world frame. Wrist: `flange`, the owning arm's flange frame, and its `arm_id` |
-| Camera `optical_frame` | Match RGB, depth and CameraInfo headers and the calibrated TF optical frame |
+| Camera `optical_frame` | Match the RGB header and the color optical frame used for capture-time TF |
+| Camera `depth_frame` / `camera_info_frame` | Declare each input header frame; omitted/null values default to `optical_frame`. Aliases do not register depth or transform its values |
+| Camera `projection` / `plane_calibration` | Default `depth`; fixed cameras may select `plane` with an offline homography, image grid, valid region and plane pose. See [plane setup](plane-projection.md) |
+| Camera `depth_geometry` | Only `color_optical_z` is supported: color-grid pixels with depth along the color optical Z axis |
+| Camera `sync_tolerance_sec` | Allowed RGB/depth acquisition difference, 0..0.1 seconds, default 0.01. Tune to the measured timing and positional error; use 0 for strict pairing; see [pairing constraints](synchronization.md) |
 | `server.namespace` | Prefix for bridge topics and its `request` service; keep both server roles consistent |
 | `server.driver_service` | Absolute name of your adapter's `RobotRequest` service |
-| `server.state_max_age` | Maximum state receipt age in seconds, greater than zero and at most 60; publish faster than this with margin |
-| `server.camera_timeout` | Wait budget for a fresh capture in seconds, greater than zero and at most 5; size it for camera cadence and TF delivery |
+| `server.remappings` | One map of original absolute ROS names to hardware endpoint names, shared by both server roles; see [ROS names](ros-names.md) |
+| Camera numerical settings / `server.future_skew_tolerance_sec` | See [numerical tolerances](numerical-tolerances.md) for calibration, depth quality and clock-skew limits |
+| `server` timing fields | Configure motion, settling, state, transport and model deadlines together; see [time budgets and driver monitor](time-budgets.md) |
+| Camera `camera_info_mode` | Select legacy rectified K or standard rectified P; see [CameraInfo integration](camera-info.md) |
+| `server.state_max_age` | Maximum state measurement and receipt age in seconds, greater than zero and at most 60; publish faster than this with margin |
+| `server.camera_timeout` | Wait budget for image/observation/capture in seconds, greater than zero and at most 3600; default 5 |
+| `server.camera_buffer_size` | Entries retained per RGB/depth buffer, 2..256, default 32; allow for delayed and reordered delivery |
+| `server.camera_max_age` | Maximum exposure age in seconds, greater than zero and at most 10; default 2. Both exposures must also be at or after the request |
+| `server.state_completion_timeout` | Wait for measured state after driver acknowledgement, greater than zero and at most 3600 seconds, default 5; also bounded by the original operation deadline |
 
 Frame IDs must be nonempty and have no leading slash. Mount declarations do not
 publish TF or calibrate cameras. Home poses, TCP offsets, grasp orientation,
@@ -67,25 +80,30 @@ unknown fields are rejected by [RobotConfig](../src/ros2_agent_server/ros2_agent
 
 ## 2. Provide telemetry, images and capture geometry
 
-With the minimal configuration, publish these inputs:
+With the default depth-based minimal configuration, publish these inputs. For
+`projection: "plane"`, only arm state and the calibrated fixed-camera JPEG are
+required here; see [plane configuration and calibration](plane-projection.md).
 
 | ROS connection | Type | Required content |
 |---|---|---|
-| `/robotics/arms/arm/state` | `std_msgs/msg/String` | Current arm/gripper JSON; reliable publisher compatible with a depth-1 subscription |
-| `/robotics/cameras/overhead/image/compressed` | `sensor_msgs/msg/CompressedImage` | Original rectified JPEG with optical frame and increasing acquisition timestamps |
-| `/robotics/cameras/overhead/camera_info` | `sensor_msgs/msg/CameraInfo` | Rectified pinhole `K`, matching frame and dimensions, zero distortion, no cropped ROI or downsampling |
-| `/robotics/cameras/overhead/depth/aligned` | `sensor_msgs/msg/Image` | Measured depth registered to RGB, exactly matching RGB stamp, frame and dimensions; `16UC1` millimetres or `32FC1` metres |
-| `/tf`, `/tf_static` | TF | World-to-camera transform chain available at the image acquisition time; wrist captures also require world-to-flange at that time |
+| `/robotics/arms/arm/state` | `std_msgs/msg/String` | Measured arm/gripper state; reliable publisher compatible with a depth-1 subscription |
+| `/robotics/cameras/overhead/image/compressed` | `sensor_msgs/msg/CompressedImage` | Original rectified JPEG with optical frame and actual acquisition timestamps |
+| `/robotics/cameras/overhead/camera_info` | `sensor_msgs/msg/CameraInfo` | Rectified image intrinsics selected by camera_info_mode; matching dimensions/header, no cropped ROI or downsampling. See [CameraInfo modes](camera-info.md) |
+| `/robotics/cameras/overhead/depth/aligned` | `sensor_msgs/msg/Image` | Measured color-grid/color-Z depth, configured header frame, matching dimensions and stamps within the configured tolerance; `16UC1` millimetres or `32FC1` metres |
+| `/tf`, `/tf_static` | TF | Camera-to-world transform (`world <- optical`) available at RGB acquisition time; wrist captures also require flange-to-world (`world <- flange`) at that time |
 
 Camera subscriptions use sensor-data QoS (best effort, volatile). Publish
 CameraInfo repeatedly or after bridge startup: a one-time publication before
 the volatile subscription exists is insufficient. Calibration need not have
 the same stamp as each exposure, but must describe the current image geometry.
 
-A complete arm-state message's `data` JSON can be:
+Publish the following JSON shape in `String.data`. Replace the illustrative
+`stamp_ns` with the actual measurement time in the shared ROS clock; see
+[telemetry](telemetry.md) for the full publisher contract:
 
 ```json
 {
+  "stamp_ns": 123000000456,
   "moving": false,
   "flange_pose": {
     "frame_id": "world",
@@ -97,15 +115,20 @@ A complete arm-state message's `data` JSON can be:
 }
 ```
 
-Map the physical gripper range to `opening` in `0..1` (closed to open). Populate
+Map the measured gripper range to `opening` in `0..1` (closed to open), or
+use null/omit the field if unavailable. The `gripper` object is required. Populate
 arm/gripper `fault` and `object_detected` from real controller/sensor data when
 available; use null for unavailable readings. See the
 [fault fields and recovery contract](../../docs/tool-lifecycle.md#failure-detection-and-controlled-retries).
-Publishing an old measurement repeatedly would pass the receipt-age check, so
-your adapter must detect upstream telemetry loss and avoid claiming fresh state.
-JointState alone is not the arm-state JSON interface.
+Repeated or older measurement stamps do not refresh state. Your adapter must
+detect upstream telemetry loss and never restamp cached values. JointState
+alone does not carry the full arm/gripper/fault contract. String JSON
+requires an actual `stamp_ns` on the existing state topic; see
+[the publisher update procedure](telemetry.md#updating-an-existing-publisher).
 
-Existing topic names can be remapped without editing the bridge. For example,
+Keep persistent topic/service overrides together in `server.remappings`,
+including TF names if needed; see the [complete example](ros-names.md).
+Existing CLI remaps also work without editing the bridge. For example,
 if your camera already provides the required message content:
 
 ```bash
@@ -124,11 +147,13 @@ Publishers, TF and server must share the ROS clock. For simulation, pass
 all participating nodes. Request deadlines still expire while simulation time
 is paused.
 
-Plain image observation uses JPEG only. Pixel detection, refinement **and grasp
-inspection** use `/capture`, which requires RGB-D and capture-time TF. One fixed
-RGB-D camera is sufficient for the minimal pick/place workflow if it shows the
-grasp clearly; a wrist camera is optional. Monocular depth inference is not
-implemented. See [capture geometry](../../docs/pixel-workflow.md#capture-geometry)
+Plain `/image` and identity-bearing `/observation` use JPEG only. Grasp
+inspection uses `/observation` and requires no depth or TF. Detection and
+refinement use `/capture`. Its default depth mode requires RGB-D and image-time
+TF; fixed cameras may instead use an offline calibrated plane. One fixed
+RGB-D camera is sufficient for minimal pick/place if it shows the grasp clearly;
+a wrist camera is optional and can be RGB-only for inspection. Monocular depth
+inference is not implemented. See [capture geometry](../../docs/pixel-workflow.md#capture-geometry)
 for projection and snapshot lifetime details.
 
 ## 3. Implement the hardware driver adapter
@@ -162,11 +187,14 @@ Agent tool names are not necessarily driver operation names. `detect_targets`
 calls ER and creates a plan inside the bridge; it sends no detection command to
 the driver. `approach_targets`, `pick_targets` and `place_targets` all become
 `execute_plan`, with different stages. `state`, `camera`, `capture`,
-`create_plan`, `refine_plan` and `verify_grasp` are handled inside the bridge.
+`observation`, `create_plan`, `refine_plan` and `verify_grasp` are handled
+inside the bridge.
 
 An `execute_plan` target contains `arm_id`, `grasp` and `release`. Each point
 contains `frame_id`, `position`, `capture_id`, `pixel` and `stamp_ns`. These are
-projected world **contact points**, not flange poses. Your driver supplies tool
+projected world **contact points**, not flange poses. Plane-derived points also
+include `projection: "plane"` and `calibration_id`; accept these provenance fields
+in your adapter. Plane points assume the selected surface lies on the calibration plane. Your driver supplies tool
 offsets, orientation, support/object offsets and approach clearance. The
 [coordinated driver contract](../../docs/pixel-workflow.md#coordinated-driver-contract)
 lists the exact phase arrays and dual-arm synchronization requirements. The
@@ -189,14 +217,18 @@ list **every requested arm exactly once, even in a one-arm installation**:
 Report failures with `success: false` and `error`, optionally `code`,
 `failed_phase`, `failed_arm_ids`, `recoverable` and `outcome`. Use
 `outcome: "unknown"` if physical completion is uncertain. Publish current
-telemetry throughout execution and when reporting completion; a fault, stale
+measured telemetry throughout execution and after reporting completion; a fault, stale
 state or negative object-detection reading can prevent the next operation.
 
 Await actual action/controller completion before returning success. Keep stop
 and telemetry callbacks runnable while motion is pending; do not block the
 driver executor waiting synchronously on another callback. On partial dual-arm
-failure, stop the group. Honor `timeout_sec` in your execution policy: expiry or
-cancellation of a ROS service future does not stop the robot. The bridge never
+failure, stop the group. The bridge reserves post-acknowledgement verification
+time before sending the remaining driver budget. Honor both `timeout_sec` and
+`deadline_ns` in your execution policy, using the smaller remaining allowance;
+see [time budgets](time-budgets.md) and
+[completion telemetry](telemetry.md#freshness-and-command-completion).
+Expiry or cancellation of a ROS service future does not stop the robot. The bridge never
 replays a timed-out motion request. A retry after failed manipulation requires
 successful all-arm stop and recovery, then a newly detected plan. Recovery must
 not blindly open a loaded gripper; unsupported safe recovery must fail.
@@ -225,10 +257,13 @@ geometry is ready; verify service presence and `/capture` separately.
 | Symptom | Check |
 |---|---|
 | State returns 503 | All configured arms publish valid current state; reliable QoS is compatible |
-| Image returns 504 | New JPEGs arrive after the request, correct optical frame, increasing stamps and shared ROS clock |
-| Capture returns 504 while image works | Exact RGB/depth timestamp pairing, delivered CameraInfo and TF available at that acquisition time |
-| Capture returns 422 | Rectification, intrinsics, frame/dimension match and supported depth encoding |
-| Command returns 503 | Driver service name/type/discovery; a subsequent motion may also require recovery |
+| Image returns 504 | New JPEGs arrive after the request, correct optical frame, fresh acquisition stamps and shared ROS clock; arrival order need not match timestamp order |
+| Capture returns 504 while image works | Configured RGB/depth tolerance and frame mapping, delivered CameraInfo and image-time TF; inspect timeout `details` |
+| Capture returns 422 | Depth mode: rectification, intrinsics, frame/dimension match and depth encoding. Plane mode: calibrated JPEG dimensions/frame |
+| Plane capture returns 409 | CameraInfo geometry changed; verify/recalibrate and restart before reusing the plane |
+| Plane creation returns 422 | Selected pixels must be inside the original image and calibrated valid region |
+| Command returns 503 | Driver service name/type/discovery and valid fresh arm state; a subsequent motion may also require recovery |
+| Motion returns 504 with `post_command_state_timeout` | Every target arm must publish a new sample measured at or after driver acknowledgement; check measurement timestamps, publish cadence and the remaining deadline |
 | Group command returns 502 | Completion acknowledgement includes `coordinated: true` and every requested arm exactly once |
 | Motion returns 409 | Active motion, faults, unknown previous outcome, invalid plan stage or required recovery; inspect the error and current state |
 
@@ -243,3 +278,22 @@ For result fields, final visual assessment and the policy after a Gemini
 connection loss or bridge restart, see [tool outcomes](../../docs/tool-results.md).
 Bridge state is in memory; establish stopped, known hardware state before
 restarting an application after an interrupted process.
+
+## Locating hardware-specific additions
+
+Use `rg -n 'HARDWARE INTEGRATION' server/src` to find code comments linked to
+this guide. The main integration points are:
+
+| Location | What to configure or implement |
+|---|---|
+| Camera fields in `models.py`, validation/projection in `pixels.py` | Declare actual input frames and pairing tolerance; supply upstream registration if the existing color-grid/color-Z contract is not met |
+| `models.py: ArmState`, `RobotBridgeNode._arm_state` | Publish measured controller/gripper data and map faults; see the telemetry guide |
+| `RobotBridgeNode._command` | Implement its service peer in your driver package: all seven operations listed above, actual completion and responsive stopping |
+| Your driver configuration | Home joint poses, TCP calibration, grasp orientation/offsets, paths, limits, coordinated execution and supported recovery |
+| `ros_names.py: RosNames` | Central name definitions and remap validation; use `server.remappings` for hardware names instead of editing node constructors |
+| Package `setup.py` / `package.xml` | Install any added launch/config files, register entry points and declare actual adapter dependencies |
+
+The runtime starts the two common server nodes only. A driver package under
+`server/src/` is discovered by the full colcon build but still needs its own
+startup command or launch file. Proposed driver files are not supplied hardware
+implementations. Do not place hardware-specific controller imports in the agent.

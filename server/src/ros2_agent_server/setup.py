@@ -1,5 +1,6 @@
 from setuptools import find_packages, setup
 
+# HARDWARE INTEGRATION: install added launch/config files through data_files.
 setup(
     name="ros2_agent_server",
     version="0.1.0",

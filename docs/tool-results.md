@@ -8,9 +8,12 @@ and task achievement. It complements [tool lifecycle](tool-lifecycle.md) and the
 
 ## Outcome contract
 
-Motion completes only when the driver returns HTTP-style status 200 and boolean
+Motion success requires a driver response with HTTP-style status 200 and boolean
 `success: true`. Group operations also require `coordinated: true` and an exact
-`completed_arm_ids` list. A 202 acceptance, malformed JSON or missing/non-boolean
+`completed_arm_ids` list. The bridge then waits for subsequent state measured
+at or after acknowledgement receipt for every target arm and checks stationary
+state, faults and applicable release telemetry. This wait shares the original
+operation deadline; stop instead relies on the physical-stop acknowledgement. A 202 acceptance, malformed JSON or missing/non-boolean
 completion is not success. Explicit failure details survive HTTP and reach Live
 in the tool response. Transport failure can mean `outcome: "unknown"`; motion
 is never automatically replayed.
@@ -29,8 +32,8 @@ telemetry after place/recovery contradicts release and prevents success.
 | `reset_arms` | Startup without a held-object plan or unresolved failure; all arms homed | Coordinated driver completion, fresh state and fault checks | Stop/recover if needed; reset cannot replace recovery or discard a held-object plan |
 | `move_arm` | Explicit measured manual flange target reached | Driver `success`, fresh arm state/fault checks | No automatic retry; stop and recover before a new attempt |
 | `move_arms` | Explicit measured targets completed as one group | Driver `success`, `coordinated`, exact `completed_arm_ids`, state/fault checks | Reject manual motion that would discard a held-object plan; preserve the recovery requirement |
-| `set_gripper` | Requested opening achieved, not necessarily an object grasped | Driver completion and arm/gripper faults | Report failure; closed jaws alone do not establish a grasp |
-| `detect_targets` | New fixed-camera grasp/release points converted into a plan | Fresh capture, strictly validated ER JSON and normalized coordinates, measured depth/TF, bridge `plan_id`, `state`, `targets` | Invalid/missing/blocked detections produce no motion; retry with a new capture or finish with failure |
+| `set_gripper` | Requested opening achieved, not necessarily an object grasped | Driver completion, subsequent measured stationary state and arm/gripper faults | Report failure; closed jaws alone do not establish a grasp |
+| `detect_targets` | New fixed-camera grasp/release points converted into a plan | Fresh capture, strictly validated ER JSON and normalized coordinates, measured depth/TF or configured fixed-plane calibration, bridge `plan_id`, `state`, `targets` | Invalid/missing/blocked detections produce no motion; retry with a new capture or finish with failure |
 | `approach_targets` | Observation/approach phase finished for every selected arm | Group driver completion and `state: "approached"` | Interrupted/failed plan is unusable; stop/recover |
 | `refine_grasp` | One grasp point replaced using its own newer wrist capture | ER output and projection; matching arm, capture-time flange pose, `plan_id` and retained release target | No movement on inference/conversion failure; obtain new evidence or recover if the plan is no longer usable |
 | `pick_targets` | Open/approach/descend/close/lift completed, not a verified grasp | Group driver completion, state/fault checks, `state: "picked"` | Inspect every arm after success; stop/recover after failed or ambiguous execution |
@@ -128,3 +131,18 @@ The driver fixture reports/simulates outcomes and records requested group stops;
 it cannot verify that a real controller physically stopped a peer arm or kept a
 shared object synchronized. These tests verify application control flow and
 contracts, not Gemini accuracy, calibration accuracy or physical robot behavior.
+
+## Measured hardware input regressions
+
+Motion success also requires a subsequent sample measured at or after acknowledgement receipt,
+for every target arm. See [telemetry](../server/docs/telemetry.md). RGB inspection
+uses identity-bearing `/observation`; detection uses configured depth or
+[plane geometry](../server/docs/plane-projection.md), while wrist refinement uses RGB-D.
+
+[Hardware contract tests](../server/tests/hardware_contract_test.py) and
+[hardware integration tests](../server/tests/hardware_integration_test.py) cover
+approximate pairing boundaries, delayed and reordered input, distinct declared
+frames, nonzero transforms, TF interpolation, telemetry replay, response-before-
+state ordering, stop during state wait, calibration/clock invalidation, request
+IDs and RGB-only grasp inspection. A response-driven Gemini scenario completes
+with delayed depth and geometry disabled after picking.

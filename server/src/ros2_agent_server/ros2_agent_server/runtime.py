@@ -1,6 +1,7 @@
 """Launch both nodes together or run either node as a separate process."""
 
 import argparse
+import logging
 import threading
 
 import rclpy
@@ -28,7 +29,10 @@ def main():
     parser.add_argument("--role", choices=("both", "http", "robot"), default="both")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--diagnostic-log-level", choices=("DEBUG", "INFO", "WARNING"), default="INFO")
     args, ros_args = parser.parse_known_args()
+    logging.basicConfig(level=logging.INFO)
+    logging.getLogger("ros2_agent_server.http").setLevel(args.diagnostic_log_level)
     config = RobotConfig.load(args.config)
     context = Context()
     rclpy.init(args=ros_args, context=context, signal_handler_options=SignalHandlerOptions.NO)
@@ -38,9 +42,9 @@ def main():
     spin_thread = None
     try:
         if args.role in {"both", "robot"}:
-            nodes.append(RobotBridgeNode(config, context=context))
+            nodes.append(RobotBridgeNode(config, context=context, cli_args=ros_args))
         if args.role in {"both", "http"}:
-            gateway = HttpGatewayNode(config, context=context)
+            gateway = HttpGatewayNode(config, context=context, cli_args=ros_args)
             nodes.append(gateway)
         for node in nodes:
             executor.add_node(node)

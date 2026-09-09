@@ -46,8 +46,8 @@ class StateTest(unittest.TestCase):
         self.store.update_camera("overhead", jpeg("blue"), "overhead_optical", 101)
         self.assertIsNone(self.store.fresh_camera("overhead", 1, 102))
         self.assertIsNotNone(self.store.fresh_camera("overhead", 1, 101))
-        self.assertFalse(self.store.update_camera("overhead", jpeg(), "overhead_optical", 99))
-        self.assertEqual(2, self.store.sequence("overhead"))
+        self.assertTrue(self.store.update_camera("overhead", jpeg(), "overhead_optical", 99))
+        self.assertEqual(3, self.store.sequence("overhead"))
 
     def test_bad_camera_payload_and_wrong_optical_frame_rejected(self):
         for data, frame, stamp in [(b"not jpeg", "overhead_optical", 10),

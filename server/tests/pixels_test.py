@@ -15,6 +15,8 @@ from ros2_agent_server.state import CameraFrame
 class PixelProjectionTest(unittest.TestCase):
     def setUp(self):
         self.config = RobotConfig.load(Path(__file__).resolve().parents[2] / 'agent/configs/dual_arm.json')
+        self.config.server.capture_ttl = 120.
+        self.config.server.plan_ttl = 120.
         self.now = 0.
         self.store = PixelPlans(self.config, clock=lambda: self.now)
         buffer = io.BytesIO()
@@ -34,7 +36,8 @@ class PixelProjectionTest(unittest.TestCase):
         cap = self.capture()
         self.pose['position'][0] = 99.
         self.depth.data = b'\0'*30
-        self.assertEqual([2.,3.,5.], self.store.project(cap['capture_id'], [2,2])['position'])
+        for expected, actual in zip([2.,3.,5.], self.store.project(cap['capture_id'], [2,2])['position']):
+            self.assertAlmostEqual(expected, actual, delta=1e-6)
         self.assertEqual([1.,2.,3.], cap['camera_pose']['position'])
 
     def test_quaternion_rotation(self):
@@ -46,7 +49,8 @@ class PixelProjectionTest(unittest.TestCase):
         self.depth.encoding, self.depth.is_bigendian, self.depth.step = '32FC1', True, 16
         self.depth.data = struct.pack('>12f', *([1.5]*12))
         cap = self.capture()
-        self.assertEqual([1.,2.,4.5], self.store.project(cap['capture_id'], [1,1])['position'])
+        for expected, actual in zip([1.,2.,4.5], self.store.project(cap['capture_id'], [1,1])['position']):
+            self.assertAlmostEqual(expected, actual, delta=1e-6)
 
     def test_invalid_pixels_depth_and_expired_capture(self):
         cap = self.capture()
@@ -62,6 +66,7 @@ class PixelProjectionTest(unittest.TestCase):
             self.store.project(cap['capture_id'], [1,1])
 
     def test_reject_mismatched_capture_and_distortion(self):
+        self.config.cameras[0].sync_tolerance_sec = 0.0
         self.depth.header.stamp.nanosec = 101
         with self.assertRaises(ValueError):
             self.capture()

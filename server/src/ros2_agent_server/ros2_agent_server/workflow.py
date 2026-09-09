@@ -47,6 +47,7 @@ class MoveArms(Model):
     moves: list[ArmMove] = Field(min_length=1, max_length=2)
 
 
+# TOOL EXTENSION: register strict workflow bodies here and classify execution in robot_node.py.
 BODIES = {'create_plan': DetectPlan, 'refine_plan': RefinePlan,
           'execute_plan': ExecutePlan, 'verify_grasp': VerifyPlan, 'move_arms': MoveArms}
 
@@ -63,9 +64,12 @@ def validate_workflow(config, operation, resource_id, payload):
     arm_ids = [item['arm_id'] for item in items]
     if 'arm_id' in body:
         arm_ids.append(body['arm_id'])
-    if len(arm_ids) != len(set(arm_ids)) or not set(arm_ids) <= {a.id for a in config.arms}:
-        raise ValueError('Arm IDs must be configured and unique')
+    if len(arm_ids) != len(set(arm_ids)):
+        raise ValueError(f'Duplicate arm IDs: {arm_ids}')
+    unknown = set(arm_ids) - {a.id for a in config.arms}
+    if unknown:
+        raise ValueError(f'Unconfigured arm IDs: {sorted(unknown)}')
     for move in body.get('moves', []):
         if move['frame_id'] not in config.frame_ids:
-            raise ValueError('Unknown motion frame')
+            raise ValueError(f"Unknown motion frame for {move['arm_id']}: {move['frame_id']!r}; expected {config.frame_ids}")
     return body
