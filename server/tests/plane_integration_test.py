@@ -98,9 +98,9 @@ class PlaneIntegrationTest(unittest.IsolatedAsyncioTestCase):
         original=f.driver.execute
         async def execute(request,response):
             result=await original(request,response)
-            if request.operation=='execute_plan':
-                stage=json.loads(request.payload_json)['stage']
-                f.driver.images['overhead']=jpeg('green' if stage=='pick' else 'blue')
+            if request.operation=='move' and json.loads(request.payload_json).get('phase') in ('lift','retreat'):
+                stage=json.loads(request.payload_json)['phase']
+                f.driver.images['overhead']=jpeg('green' if stage=='lift' else 'blue')
             return result
         f.driver.execute=execute
         stream=ScenarioStream('success',['arm'],lambda *args:None)
@@ -125,10 +125,12 @@ class PlaneIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(prompts)
         self.assertIn('calibrated plane, not measured depth',prompts[0])
         self.assertIn('test-table-v1',prompts[0])
-        stages=[payload for op,_,payload in f.driver.calls if op=='execute_plan']
-        self.assertEqual(['pick','place'],[p['stage'] for p in stages])
-        for stage in stages:
-            for target in stage['targets']:
-                self.assertEqual('plane',target['grasp']['projection'])
-                self.assertAlmostEqual(3.,target['grasp']['position'][2])
+        stages=[payload for op,_,payload in f.driver.calls if op=='prepare' and payload['steps'][-1].get('phase')]
+        self.assertEqual(['lift','retreat'],[p['steps'][-1]['phase'] for p in stages])
+        plan=next(iter(f.robot.pixels.plans.values()))
+        self.assertEqual('plane',plan['targets'][0]['grasp']['projection'])
+        self.assertAlmostEqual(3.,plan['targets'][0]['grasp']['position'][2])
+        contact=stages[0]['steps'][2]['targets'][0]
+        self.assertAlmostEqual(3.,contact['position'][2])
+        self.assertEqual('tcp',contact['reference'])
         self.assertFalse(f.robot._depth)

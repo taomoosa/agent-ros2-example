@@ -5,7 +5,7 @@ import json
 
 from pydantic import ValidationError
 
-from .models import MoveArm, Gripper, Stop
+from .models import Stop
 
 
 class BridgeError(Exception):
@@ -60,12 +60,26 @@ def validate_request(config, operation, resource_id, payload):
         raise BridgeError(422, "Request payload must be a JSON object")
     arms = {arm.id for arm in config.arms}
     cameras = {camera.id for camera in config.cameras}
-    if operation in {"move_arm", "set_gripper"} and resource_id not in arms:
-        raise BridgeError(404, f"Unknown arm: {resource_id}")
     if operation in {"camera", "capture", "observation"} and resource_id not in cameras:
         raise BridgeError(404, f"Unknown camera: {resource_id}")
+    if operation in {'move', 'gripper'}:
+        from .motion import Move, Grip
+        try:
+            if resource_id:
+                raise ValueError('Unified commands use arm_ids/all_arms, not resource_id')
+            body = (Move if operation == 'move' else Grip).model_validate(payload)
+            ids = body.selected(config)
+            if operation == 'move' and len(body.targets) not in (1,len(ids)):
+                raise ValueError('targets must contain one shared target or one target per arm')
+            if operation == 'move':
+                for target in body.targets:
+                    if target.kind == 'pose' and target.frame_id not in config.frame_ids:
+                        raise ValueError(f'Unknown coordinate frame: {target.frame_id}')
+            return body.model_dump()
+        except ValueError as exc:
+            raise BridgeError(422,str(exc)) from exc
     from .workflow import BODIES, validate_workflow
-    if operation in BODIES or operation in {'reset_arms', 'recover_arms'}:
+    if operation in BODIES or operation in {'recover_arms'}:
         try:
             return validate_workflow(config, operation, resource_id, payload)
         except ValidationError as exc:
@@ -74,20 +88,13 @@ def validate_request(config, operation, resource_id, payload):
         except ValueError as exc:
             raise BridgeError(422, str(exc)) from exc
     try:
-        if operation == "move_arm":
-            body = MoveArm.model_validate(payload)
-            if body.frame_id not in config.frame_ids:
-                raise BridgeError(422, f"Unknown coordinate frame: {body.frame_id}")
-            return body.model_dump()
-        if operation == "set_gripper":
-            return Gripper.model_validate(payload).model_dump()
         if operation == "stop":
             body = Stop.model_validate(payload)
-            if body.arm_id is not None and body.arm_id not in arms:
-                raise BridgeError(404, f"Unknown arm: {body.arm_id}")
             if resource_id:
-                raise BridgeError(422, "stop uses payload.arm_id, not resource_id")
-            return body.model_dump()
+                raise BridgeError(422, "stop uses arm_ids/all_arms, not resource_id")
+            from .motion import Selection
+            ids = Selection(arm_ids=body.arm_ids, all_arms=body.all_arms if "all_arms" in body.model_fields_set else body.arm_ids is None).selected(config)
+            return dict(arm_ids=ids)
         if operation in {"state", "camera", "capture", "observation"}:
             if payload:
                 raise BridgeError(422, f"{operation}: unexpected payload fields {sorted(payload)}")
@@ -97,4 +104,6 @@ def validate_request(config, operation, resource_id, payload):
     except ValidationError as exc:
         raise BridgeError(422, "Request validation failed", details=[
             {k: item[k] for k in ("loc", "msg", "type")} for item in exc.errors()]) from exc
+    except ValueError as exc:
+        raise BridgeError(422,str(exc)) from exc
     raise BridgeError(404, f"Unknown operation: {operation}")

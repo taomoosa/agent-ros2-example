@@ -3,7 +3,7 @@
 from embodiment.ros2.config import RobotConfig
 
 
-# TOOL EXTENSION: declare triggers/arguments here; see server/docs/extending.md.
+# TOOL EXTENSION: declare triggers/arguments here; see server/docs/primitive-adapter.md#adding-and-exposing-tools.
 def ros2_tools(config: RobotConfig) -> list[dict]:
   arm = {"type": "STRING", "enum": [item.id for item in config.arms]}
   declarations = []
@@ -19,19 +19,6 @@ def ros2_tools(config: RobotConfig) -> list[dict]:
 
   add("get_robot_state", "Observe at startup, after placement/stop, or while waiting. Read current poses, faults, "
       "gripper telemetry and local plan/recovery status; a fresh camera observation follows.", {}, blocking=True)
-  add("move_arm", "Move the selected arm flange to a pose. Metres; unit quaternion in xyzw order. "
-      "Use only measured or user-supplied poses. The ROS2 server resolves TF and validates motion.", {
-          "arm_id": arm,
-          "frame_id": {"type": "STRING", "enum": list(config.frame_ids)},
-          "position": {"type": "ARRAY", "items": {"type": "NUMBER"}, "minItems": 3, "maxItems": 3},
-          "orientation": {"type": "ARRAY", "items": {"type": "NUMBER"}, "minItems": 4, "maxItems": 4},
-          "duration": {"type": "NUMBER", "minimum": 0.1, "maximum": 60,
-                       "description": "Motion duration in seconds; default 3."},
-      }, ("arm_id", "frame_id", "position", "orientation"), blocking=True)
-  add("set_gripper", "Set the selected gripper opening: 0 closed, 1 open.", {
-      "arm_id": arm, "opening": {"type": "NUMBER", "minimum": 0, "maximum": 1},
-  }, ("arm_id", "opening"), blocking=True)
-  add("stop", "Stop one arm, or all arms when arm_id is omitted.", {"arm_id": arm})
   add("finish_task", "Finish after get_robot_state delivers fresh state and imagery following the latest motion attempt. "
       "Report failure honestly if the task cannot be completed.", {
           "success": {"type": "BOOLEAN"}, "summary": {"type": "STRING"},
@@ -45,12 +32,12 @@ def ros2_tools(config: RobotConfig) -> list[dict]:
       "Only after success read state and detect a NEW plan. Attempts are limited per application; "
       "unsupported or unrecoverable faults require finish_task(success=false).", {}, blocking=True)
   add("detect_targets", "After startup/reset, successful recovery, or verified placement, ask Gemini Robotics ER for new grasp/release pixels. "
-      "ROS2 projects using measured depth/TF or the fixed camera calibrated plane. In plane mode select on-plane points only. For a shared object include both arms in one plan.",
+      "ROS2 projects using measured depth/TF or the fixed camera calibrated plane. In plane mode select on-plane points only. Select exactly the participating arm_ids: one arm also works in a two-arm setup. Select both arms for a coupled shared-object plan. Later approach/pick/place use this same group; they do not add other configured arms.",
       {"camera_id": camera, "instruction": text,
        "arm_ids": {"type": "ARRAY", "items": arm, "minItems": 1, "maxItems": len(config.arms)}},
       ("camera_id", "instruction", "arm_ids"), blocking=True)
   for name, description in (
-      ("approach_targets", "Move all plan arms to driver-defined observation/approach poses before optional wrist refinement."),
+      ("approach_targets", "Move all plan arms to configured observation/approach poses before optional wrist refinement."),
       ("pick_targets", "Execute coordinated open, approach, descend, close and lift phases for every plan arm. Then inspect_grasp for each arm and verify_grasp."),
       ("place_targets", "After successful verify_grasp, execute coordinated transfer, descend, open and retreat for all plan arms.")):
     add(name, description, plan, ("plan_id",), blocking=True)
@@ -72,13 +59,27 @@ def ros2_tools(config: RobotConfig) -> list[dict]:
                   "arm_id": arm, "observation_id": text, "success": {"type": "BOOLEAN"}, "reason": text},
               "required": ["arm_id", "observation_id", "success", "reason"]}}),
       ("plan_id", "observations"), blocking=True)
-  pose_properties = dict(next(d for d in declarations if d['name'] == 'move_arm')['parameters']['properties'])
-  add("move_arms", "Move one or both arms in ONE coordinated driver request using measured metric flange poses. "
-      "Invalidates pixel plans. For a shared object prefer a dual-arm pick plan, which includes synchronized lifting.",
-      {"moves": {"type": "ARRAY", "minItems": 1, "maxItems": len(config.arms),
-                 "items": {"type": "OBJECT", "properties": pose_properties,
-                           "required": ["arm_id", "frame_id", "position", "orientation"]}}},
-      ("moves",), blocking=True)
+  duration = {'type':'NUMBER','minimum':.1,'maximum':60}
   if not any(c.mount == 'flange' for c in config.cameras):
     declarations = [d for d in declarations if d['name'] not in {'approach_targets', 'refine_grasp'}]
+  selection = {
+      'arm_ids': {'type':'ARRAY','items':arm,'minItems':1,'maxItems':len(config.arms)},
+      'all_arms': {'type':'BOOLEAN','description':'Use true for all configured arms. Mutually exclusive with arm_ids.'}}
+  target = {'type':'OBJECT','properties': {
+      'kind': {'type':'STRING','enum':['pixel','named']},
+      'capture_id': {'type':'STRING'},
+      'pixel': {'type':'ARRAY','items':{'type':'INTEGER'},'minItems':2,'maxItems':2},
+      'profile': {'type':'STRING','enum':['tabletop']},
+      'offset_m': {'type':'NUMBER','minimum':0,'maximum':1},
+      'name': {'type':'STRING','description':f'Available names and descriptions per arm: {config.position_names}'}}, 'required':['kind']}
+  add('move', 'Move selected arm_ids or all_arms=true. Targets are in arm_ids order; one target broadcasts. '
+      'pixel requires capture_id, original pixel and profile=tabletop. named requires a configured name (home for startup). '
+      'Do not invent coordinates or capture IDs. Manual moves invalidate plans; use pick/place tools for held objects.',
+      dict(selection,targets={'type':'ARRAY','items':target,'minItems':1,'maxItems':len(config.arms)},duration=duration),
+      ('targets',),blocking=True)
+  add('gripper','Operate selected arm_ids or all_arms=true with one normalized opening. '
+      'Coordinated group completion is required; closure does not prove grasp success.',
+      dict(selection,opening={'type':'NUMBER','minimum':0,'maximum':1}),('opening',),blocking=True)
+  add('stop','Interrupt selected arm_ids or all_arms=true immediately. Omitted selection stops all arms. '
+      'Partial stops during coupled work expand to its group; inspect stopped_arm_ids and recovery state.',selection)
   return [{"functionDeclarations": declarations}]

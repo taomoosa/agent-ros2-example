@@ -20,12 +20,18 @@ callbacks and stop requests to run while a capture or command is pending.
 Both nodes run in one process by default; `--role` can separate them into two
 processes.
 
+The server expands plan stages into basic hardware operations. The
+[primitive adapter guide](docs/primitive-adapter.md) includes pose/pixel/named
+targets, the [example driver](examples/primitive_driver.py), phase execution
+and group-stop behavior. Configure task `server.hardware.profiles` and advertise `position_names`;
+register named coordinates and TCP calibration in your hardware backend.
+
 For your first hardware installation, follow the
 [integration guide](docs/integration.md): it identifies the configuration,
 telemetry/camera adapters and driver operations you must supply, with a minimal
 configuration and bring-up checks. For a fixed camera with unreliable depth,
 [plane projection](docs/plane-projection.md) can use an offline calibration. When adding a capability, use the
-[extension guide](docs/extending.md) for the exact server/agent files to change,
+[extension guide](docs/primitive-adapter.md#adding-and-exposing-tools) for the exact server/agent files to change,
 validation and motion lifecycle requirements, and tests to extend.
 
 ## Setup and startup
@@ -151,10 +157,10 @@ request and response type.
 | Request field | Meaning |
 |---|---|
 | `request_id` | Correlates HTTP, gateway, bridge and driver logs; rebuild all service consumers after updating the interface |
-| `operation` | `state`, `camera`, `capture`, `observation`, `move_arm`, `set_gripper`, `stop`, `create_plan`, `refine_plan`, `execute_plan`, `verify_grasp`, `reset_arms`, `move_arms`, `recover_arms` |
-| `resource_id` | Camera ID for camera/capture/observation requests; arm ID for move/gripper requests; empty for state, stop and workflow operations |
+| `operation` | `state`, `camera`, `capture`, `observation`, `stop`, `create_plan`, `refine_plan`, `execute_plan`, `verify_grasp`, `recover_arms`, `move`, `gripper` (bridge). Drivers accept only `prepare`, `move`, `gripper`, `stop` and optional `recover` |
+| `resource_id` | Camera ID for camera/capture/observation requests; empty for state and all motion/workflow requests; arm selection is in the payload |
 | `payload_json` | Gateway-to-bridge: validated HTTP fields. Bridge-to-driver: command payload, enriched with targets/phases/arm IDs as applicable; see the [driver operation map](docs/integration.md#3-implement-the-hardware-driver-adapter) |
-| `deadline_ns` | Shared ROS-clock deadline; zero for direct legacy callers. Rebuild every interface consumer |
+| `deadline_ns` | Shared ROS-clock deadline; zero for direct callers without a shared clock deadline. Rebuild every interface consumer |
 | `timeout_sec` | Response deadline in seconds, greater than 0 and at most 15000 |
 
 | Response field | Meaning |
@@ -164,17 +170,18 @@ request and response type.
 | `data` | JPEG bytes; empty for ordinary command responses |
 | `content_type` | `application/json` or `image/jpeg` |
 
-Drivers handle `move_arm`, `set_gripper`, `stop`, `reset_arms`, `move_arms`,
-`recover_arms`, and `execute_plan`. See the [pixel workflow](../docs/pixel-workflow.md) for
-additional camera_info/aligned-depth/TF subscriptions, capture and plan payloads,
-and mandatory group synchronization/completion semantics. The stop target is the
-`arm_id` field in `payload_json`; null means all arms.
+The driver receives preflighted primitive sequences, not high-level plans.
+`PrimitiveAdapter` handles reservation, order, deadlines and cancellation;
+implement `HardwareBackend` hooks for your controllers. See the
+[pixel workflow](../docs/pixel-workflow.md) and
+[adapter contract](docs/primitive-adapter.md). HTTP stop uses `arm_ids` or
+`all_arms`; the bridge resolves selection and sends `arm_ids` to the driver.
+Partial stops expand to active or remembered coupled groups.
 
-For `move_arm`, `set_gripper` and `stop`, return `status_code=200` and
-`{"success": true}` **after the command completes**. Group operations
-(`reset_arms`, `move_arms`, `execute_plan`, `recover_arms`) additionally require
-`"coordinated": true` and `"completed_arm_ids"` listing every requested arm
-exactly once, even for a single arm.
+Every completed driver operation requires `status_code=200`, boolean
+`success: true`, `coordinated: true` and `completed_arm_ids` listing every
+requested arm exactly once, including a single arm. The adapter adds these
+fields only after its backend hook reports actual completion.
 Report failure with `{"success": false, "error": "..."}` or a 4xx/5xx status.
 Responses that indicate acceptance without completion, such as 202, are
 converted to 502. Motion timeouts, including missing post-command telemetry,
@@ -184,15 +191,16 @@ automatically retried. Cancelling a service wait does not stop physical motion;
 the driver must handle stop requests separately.
 
 Hardware-specific MoveIt, action, and controller integrations are not
-included. Capture-time TF lookup and RGB-D projection are implemented by the bridge. The driver is responsible for transforming flange targets, planning,
+included. Capture-time TF lookup and RGB-D projection are implemented by the bridge. The driver is responsible for resolving named goals, honoring TCP/flange references, planning,
 collision checks, speed and force limits, and stopping active motion. Physical
 commands return 503 when no driver service is connected. The test driver in
 `tests/helpers.py` is not used by the runtime nodes.
 
-The [tool lifecycle guide](../docs/tool-lifecycle.md) defines recovery after
-failed motion, optional arm/gripper faults and object-detection telemetry, and
-the one-fixed-camera configuration `configs/minimal.json`. Recovery is a
-separate coordinated driver operation; returning home alone is not recovery.
+The [tool outcome guide](../docs/tool-results.md) defines recovery after failed
+motion and the role of fault/object telemetry. Returning home alone is not
+recovery. For one fixed camera and one arm, follow the
+[minimal workflow setup](../docs/pixel-workflow.md#minimal-setup), including the
+required task profiles and backend position registration.
 
 ## Processing time and standard camera input
 
@@ -242,3 +250,10 @@ HTTP unit tests follow the [FastAPI async testing documentation](https://fastapi
 The code in `server/` was added in this repository and is provided under Apache
 License 2.0. See the [license text](../third_party/robotics-samples-LICENSE) and the
 [project README](../README.md) for attribution of the upstream agent code.
+
+Named positions are advertised in `server.hardware.position_names` as
+`{"arm":{"home":"Initial position for task startup."}}`. Only the mechanism
+maps those names to actual positions, in its own format. Gemini's `move` tool
+accepts pixel or named targets; direct poses are reserved for programmatic HTTP
+clients. See [the plan arm-selection contract](../docs/pixel-workflow.md#plan-arm-selection) for one-arm and coupled
+two-arm detection, pick and placement.

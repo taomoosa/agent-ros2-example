@@ -140,6 +140,7 @@ class RobotConfig:
   arms: tuple[Arm, ...]
   cameras: tuple[Camera, ...]
   timing: Timing = dataclasses.field(default_factory=Timing)
+  position_names: dict = dataclasses.field(default_factory=dict)
 
   def __post_init__(self):
     url = urlsplit(self.robot_url)
@@ -175,12 +176,29 @@ class RobotConfig:
         *(camera.optical_frame for camera in self.cameras),
     ]))
 
+  @staticmethod
+  def _position_names(hardware):
+    if 'named_positions' in hardware:
+      raise ValueError('Move hardware.named_positions coordinates to the backend; advertise position_names only')
+    names = hardware.get('position_names', {})
+    if not isinstance(names, dict):
+      raise ValueError('position_names must map arm IDs to name-description catalogs')
+    for arm, values in names.items():
+      if (not isinstance(values,dict) or any(
+          not isinstance(name,str) or not name.strip() or not isinstance(description,str) or not description.strip()
+          for name,description in values.items())):
+        raise ValueError(f'position_names.{arm} must map nonempty names to nonempty descriptions')
+    return {arm:dict(values) for arm,values in names.items()}
+
   @classmethod
   def load(cls, path: str | Path) -> "RobotConfig":
     data = json.loads(Path(path).read_text())
+    if "driver_mode" in data.get("server", {}):
+      raise ValueError("server.driver_mode was removed; migrate the hardware adapter and remove this setting")
     return cls(
         robot_url=data["robot_url"], world_frame=data["world_frame"],
         arms=tuple(Arm(**arm) for arm in data["arms"]),
         cameras=tuple(Camera(**camera) for camera in data["cameras"]),
         timing=Timing.from_server(data.get("server", {})),
+        position_names=cls._position_names(data.get('server', {}).get('hardware', {})),
     )

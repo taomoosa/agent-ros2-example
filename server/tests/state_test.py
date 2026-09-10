@@ -71,10 +71,11 @@ class StateTest(unittest.TestCase):
     def test_internal_requests_are_also_validated(self):
         good = {"frame_id": "world", "position": [0, 0, 0], "orientation": [0, 0, 0, 1]}
         for operation, resource, payload, code in [
-            ("move_arm", "unknown", good, 404), ("camera", "unknown", {}, 404),
-            ("move_arm", "left", good | {"frame_id": "unknown"}, 422),
-            ("move_arm", "left", good | {"duration": float("nan")}, 422),
-            ("set_gripper", "left", {"opening": True}, 422),
+            ('move','',dict(arm_ids=['unknown'],targets=[dict(kind='pose',**good)]),422),
+            ('camera','unknown',{},404),
+            ('move','',dict(arm_ids=['left'],targets=[dict(kind='pose',**(good|{'frame_id':'unknown'}))]),422),
+            ('move','',dict(arm_ids=['left'],targets=[dict(kind='pose',**good)],duration=float('nan')),422),
+            ('gripper','',dict(arm_ids=['left'],opening=True),422),
             ("state", "", {"unexpected": 1}, 422), ("navigate", "", {}, 404),
         ]:
             with self.subTest(operation=operation), self.assertRaises(BridgeError) as error:

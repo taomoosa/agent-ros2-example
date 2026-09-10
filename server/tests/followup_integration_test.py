@@ -34,9 +34,10 @@ class FollowupIntegrationTest(unittest.IsolatedAsyncioTestCase):
                                 fixture.driver.publish()
                                 await eventually(lambda: all(fixture.robot.store._arms[a][0]['gripper'].get('object_detected') is sensor for a in arms))
                                 pose = dict(frame_id='world', position=[0.,0.,.3], orientation=[0.,0.,0.,1.])
-                                path = '/v1/arms/' + (operation if operation in ('poses','reset') else arms[0]+'/'+operation)
-                                body = dict(moves=[dict(pose,arm_id=a) for a in arms]) if operation=='poses' else (
-                                    {} if operation=='reset' else {'opening':1.} if operation=='gripper' else pose)
+                                path = '/v1/gripper' if operation=='gripper' else '/v1/move'
+                                body = dict(arm_ids=[arms[0]],opening=1.) if operation=='gripper' else (
+                                    dict(all_arms=True,targets=[dict(kind='named',name='home')]) if operation=='reset' else
+                                    dict(arm_ids=arms if operation=='poses' else [arms[0]],targets=[dict(kind='pose',**pose)]))
                                 count = len(fixture.driver.calls)
                                 denied = await http.post(path, json=body)
                                 self.assertEqual(409, denied.status_code, denied.text)
@@ -58,7 +59,7 @@ class FollowupIntegrationTest(unittest.IsolatedAsyncioTestCase):
             await fixture.ready()
             async with httpx.AsyncClient(transport=httpx.ASGITransport(
                     app=create_app(fixture.gateway,fixture.config)),base_url='http://test') as http:
-                for operation in ('reset_arms','recover_arms'):
+                for operation in ('recover_arms',):
                     for payload in ({'arm_id':'left'}, None, [], False, 42, ''):
                         raw = json.dumps(payload)
                         route = '/v1/arms/' + ('reset' if operation=='reset_arms' else 'recover')
@@ -85,7 +86,7 @@ class FollowupIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 await eventually(lambda: fixture.robot.store._arms['arm'][0]['gripper'].get('object_detected') is True)
                 original=fixture.driver.execute
                 async def false_completion(request,response):
-                    if request.operation in ('execute_plan','recover_arms'):
+                    if request.operation in ('gripper','recover'):
                         return Reply(payload=dict(success=True,coordinated=True,completed_arm_ids=['arm'])).to_ros(response)
                     return await original(request,response)
                 fixture.driver.execute=false_completion
@@ -106,15 +107,15 @@ class FollowupIntegrationTest(unittest.IsolatedAsyncioTestCase):
             await fixture.ready()
             entered, release = asyncio.Event(), asyncio.Event()
             async def command(operation,resource,payload,timeout, **kwargs):
-                if payload['arm_id'] is None:
+                if set(payload['arm_ids']) == {'left','right'}:
                     entered.set()
                     await release.wait()
                     return Reply(payload={'success':True})
                 return Reply(payload={'success':False,'error':'Stop failed'})
             fixture.robot._command = command
-            old = asyncio.create_task(fixture.robot._workflow('stop','',{'arm_id':None},1.))
+            old = asyncio.create_task(fixture.robot._workflow('stop','',{'arm_ids':['left','right']},1.))
             await asyncio.wait_for(entered.wait(),1.)
-            newer = await fixture.robot._workflow('stop','',{'arm_id':'left'},1.)
+            newer = await fixture.robot._workflow('stop','',{'arm_ids':['left']},1.)
             self.assertFalse(newer.payload['success'])
             release.set()
             late = await asyncio.wait_for(old,1.)
@@ -131,8 +132,8 @@ class FollowupIntegrationTest(unittest.IsolatedAsyncioTestCase):
             fixture.driver.states['arm']['moving']=True
             fixture.driver.publish()
             await eventually(lambda: fixture.robot.store._arms['arm'][0]['moving'])
-            reply = await fixture.gateway.request('move_arm','arm',dict(frame_id='world',
-                position=[0.,0.,.3],orientation=[0.,0.,0.,1.]),1.)
+            reply = await fixture.gateway.request('move', '', dict(arm_ids=['arm'], targets=[dict(kind='pose', **dict(frame_id='world',
+                position=[0.,0.,.3],orientation=[0.,0.,0.,1.]))]) ,1.)
             self.assertEqual(409,reply.status)
             self.assertEqual('arm_moving',reply.payload['failures'][0]['code'])
             self.assertEqual([],fixture.driver.calls)
@@ -143,7 +144,7 @@ class FollowupIntegrationTest(unittest.IsolatedAsyncioTestCase):
         fixture = RosFixture(config('dual_arm.json'))
         try:
             await fixture.ready()
-            result = await fixture.gateway.request('stop','',{'arm_id':'left'},1.)
+            result = await fixture.gateway.request('stop','',{'arm_ids':['left']},1.)
             self.assertTrue(result.payload['success'])
             state = await fixture.gateway.request('state','',{},1.)
             self.assertFalse(state.payload['motion_outcome_unknown'])

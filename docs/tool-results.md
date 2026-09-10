@@ -1,9 +1,9 @@
 # Tool outcomes and scenario coverage
 
 This guide separates transport success, command completion, visual assessment
-and task achievement. It complements [tool lifecycle](tool-lifecycle.md) and the
+and task achievement. It complements [pixel workflow](pixel-workflow.md) and the
 [driver integration guide](../server/docs/integration.md). The tables cover all
-15 tool names; a configuration without a wrist camera exposes 13, omitting
+14 tool names; a configuration without a wrist camera exposes 12, omitting
 `approach_targets` and `refine_grasp`.
 
 ## Outcome contract
@@ -30,9 +30,8 @@ telemetry after place/recovery contradicts release and prevents success.
 |---|---|---|---|
 | `get_robot_state` | Startup, after motion/recovery, and before finishing; current state and a newly delivered scene image | `/v1/state`: arm state, faults, `recovery_required`, `motion_outcome_unknown`; Live response: `success`, `post_action_observation`, `observation_revision` | State or fresh image failure is reported as failure; observe again within the application budget or finish with failure |
 | `reset_arms` | Startup without a held-object plan or unresolved failure; all arms homed | Coordinated driver completion, fresh state and fault checks | Stop/recover if needed; reset cannot replace recovery or discard a held-object plan |
-| `move_arm` | Explicit measured manual flange target reached | Driver `success`, fresh arm state/fault checks | No automatic retry; stop and recover before a new attempt |
-| `move_arms` | Explicit measured targets completed as one group | Driver `success`, `coordinated`, exact `completed_arm_ids`, state/fault checks | Reject manual motion that would discard a held-object plan; preserve the recovery requirement |
-| `set_gripper` | Requested opening achieved, not necessarily an object grasped | Driver completion, subsequent measured stationary state and arm/gripper faults | Report failure; closed jaws alone do not establish a grasp |
+| `move` | Pixel/named targets completed as one group | Driver `success`, `coordinated`, exact `completed_arm_ids`, state/fault checks | Reject manual motion that would discard a held-object plan; preserve the recovery requirement |
+| `gripper` | Requested opening achieved, not necessarily an object grasped | Driver completion, subsequent measured stationary state and arm/gripper faults | Report failure; closed jaws alone do not establish a grasp |
 | `detect_targets` | New fixed-camera grasp/release points converted into a plan | Fresh capture, strictly validated ER JSON and normalized coordinates, measured depth/TF or configured fixed-plane calibration, bridge `plan_id`, `state`, `targets` | Invalid/missing/blocked detections produce no motion; retry with a new capture or finish with failure |
 | `approach_targets` | Observation/approach phase finished for every selected arm | Group driver completion and `state: "approached"` | Interrupted/failed plan is unusable; stop/recover |
 | `refine_grasp` | One grasp point replaced using its own newer wrist capture | ER output and projection; matching arm, capture-time flange pose, `plan_id` and retained release target | No movement on inference/conversion failure; obtain new evidence or recover if the plan is no longer usable |
@@ -53,6 +52,26 @@ state/image pair obsolete. Grasp inspection uses separate original-image
 `image_delivered` evidence; ordinary mosaics pause while inspection is pending.
 The CLI tool-result events reflect the response sent to Live, including image
 acquisition/delivery failures.
+
+## Recovery and retry limits
+
+- Read-only detection/refinement failures can be retried with new imagery and
+  clearer instructions. Invalid ER output never authorizes motion.
+- Reassessing an uncertain grasp requires a new inspection: submitted evidence
+  is consumed, so a changed answer cannot reuse it.
+- Repeating physical manipulation after failure requires confirmed all-arm stop,
+  successful `recover_arms`, new detection and a new plan. Stop or named home
+  alone does not clear the recovery requirement.
+- `recover_arms` first stops all arms, then requests recovery only if stop succeeds.
+  The application permits two recovery calls by default, counting failed attempts;
+  `--max-recovery-attempts 0..10` sets the total. Recovery does not reset it.
+- Unsupported recovery, unrecoverable faults or an exhausted recovery budget
+  require task failure/operator handling. No fallback opens a loaded gripper.
+
+Recovery uses the optional backend hook described in the
+[adapter contract](../server/docs/primitive-adapter.md#why-state-prepare-and-recover-are-separate).
+Fault/object sensor fields are defined in [telemetry](../server/docs/telemetry.md);
+execution, stop and delivery budgets are defined in [time budgets](../server/docs/time-budgets.md).
 
 ## Final placement assessment
 
@@ -146,3 +165,11 @@ frames, nonzero transforms, TF interpolation, telemetry replay, response-before-
 state ordering, stop during state wait, calibration/clock invalidation, request
 IDs and RGB-only grasp inspection. A response-driven Gemini scenario completes
 with delayed depth and geometry disabled after picking.
+
+
+## Shared motion selection
+
+`move`, `gripper` and `stop` use `arm_ids`/`all_arms` selection in every
+configuration. `reset_arms` remains a semantic startup convenience and sends
+one named-home move. See [primitive motion](../server/docs/primitive-adapter.md)
+for HTTP and hardware mapping.

@@ -45,13 +45,19 @@ class HardwareIntegrationTest(unittest.IsolatedAsyncioTestCase):
     async def test_timeout_reports_matching_reason_and_observation_needs_no_geometry(self):
         f = await self.make_fixture()
         f.driver.publish_geometry = False
-        f.robot._depth.clear()
-        f.robot._calibration.clear()
-        with mock.patch.object(f.robot, 'get_logger', return_value=mock.Mock()) as logger:
-            result = await f.gateway.request('capture', 'overhead', {}, .15)
-            self.assertEqual(504, result.status)
-            self.assertEqual('camera_info_unavailable', result.payload['details']['code'])
-            self.assertTrue(logger.return_value.warning.called)
+        # Suppress in-flight calibration deliveries too; clearing the cache alone
+        # races with a CameraInfo already queued before publishing was disabled.
+        with mock.patch.object(f.robot, '_camera_info', return_value=None):
+            barrier = f.executor.create_task(lambda: None)
+            await eventually(barrier.done)
+            with f.robot._lock:
+                f.robot._depth.clear()
+                f.robot._calibration.clear()
+            with mock.patch.object(f.robot, 'get_logger', return_value=mock.Mock()) as logger:
+                result = await f.gateway.request('capture', 'overhead', {}, .15)
+                self.assertEqual(504, result.status)
+                self.assertEqual('camera_info_unavailable', result.payload['details']['code'])
+                self.assertTrue(logger.return_value.warning.called)
         image = await f.gateway.request('observation', 'overhead', {}, .3)
         self.assertEqual(200, image.status)
         self.assertEqual('rgb', image.payload['kind'])
@@ -74,7 +80,7 @@ class HardwareIntegrationTest(unittest.IsolatedAsyncioTestCase):
     async def test_new_state_after_response_is_required_for_every_arm(self):
         f = await self.make_fixture('dual_arm.json')
         f.driver.skip_states = {'left', 'right'}
-        call = asyncio.create_task(f.gateway.request('reset_arms', '', {}, 1.))
+        call = asyncio.create_task(f.gateway.request('move', '', dict(all_arms=True,targets=[dict(kind='named',name='home')]) ,1.))
         await eventually(lambda: any(p.check is not None for p in f.robot._pending))
         self.assertFalse(call.done())
         f.driver.skip_states = {'right'}
@@ -89,13 +95,13 @@ class HardwareIntegrationTest(unittest.IsolatedAsyncioTestCase):
     async def test_stale_republication_after_completion_latches_unknown(self):
         f = await self.make_fixture()
         f.driver.state_stamp_ns = f.robot.store._arms['arm'][2]
-        result = await f.gateway.request('reset_arms', '', {}, 1.)
+        result = await f.gateway.request('move', '', dict(all_arms=True,targets=[dict(kind='named',name='home')]) ,1.)
         self.assertEqual(504, result.status)
         self.assertEqual('post_command_state_timeout', result.payload['code'])
         self.assertEqual('unknown', result.payload['outcome'])
-        blocked = await f.gateway.request('reset_arms', '', {}, 1.)
+        blocked = await f.gateway.request('move', '', dict(all_arms=True,targets=[dict(kind='named',name='home')]) ,1.)
         self.assertEqual(409, blocked.status)
-        stopped = await f.gateway.request('stop', '', {'arm_id':None}, .5)
+        stopped = await f.gateway.request('stop', '', {'all_arms':True}, .5)
         self.assertTrue(stopped.payload['success'])
 
     async def test_standard_string_state_requires_measurement_time_and_same_fault_contract(self):
@@ -104,7 +110,7 @@ class HardwareIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(result.payload['arms'][0]['measurement_stamp_ns'], 0)
         self.assertEqual('/robotics/arms/arm/state', f.config.state_topic('arm'))
         self.assertIn((f.config.state_topic('arm'), ['std_msgs/msg/String']), f.robot.get_topic_names_and_types())
-        result = await f.gateway.request('reset_arms', '', {}, 1.)
+        result = await f.gateway.request('move', '', dict(all_arms=True,targets=[dict(kind='named',name='home')]) ,1.)
         self.assertTrue(result.payload['success'])
 
     async def test_tf_interpolates_at_image_time_and_reports_missing_transform(self):
@@ -170,10 +176,10 @@ class HardwareIntegrationTest(unittest.IsolatedAsyncioTestCase):
         original = f.driver.execute
         async def execute(request, response):
             result = await original(request, response)
-            if request.operation == 'execute_plan':
-                stage = json.loads(request.payload_json)['stage']
-                f.driver.images['overhead'] = jpeg('green' if stage == 'pick' else 'blue')
-                if stage == 'pick':
+            if request.operation == 'move' and json.loads(request.payload_json).get('phase') in ('lift','retreat'):
+                stage = json.loads(request.payload_json)['phase']
+                f.driver.images['overhead'] = jpeg('green' if stage == 'lift' else 'blue')
+                if stage == 'lift':
                     f.driver.publish_geometry = False
                     f.driver.geometry_queue.clear()
                     f.robot._depth.clear()
@@ -199,15 +205,15 @@ class HardwareIntegrationTest(unittest.IsolatedAsyncioTestCase):
     async def test_stop_interrupts_waiting_for_post_command_measurement(self):
         f = await self.make_fixture()
         f.driver.publish_states = False
-        motion = asyncio.create_task(f.gateway.request('reset_arms', '', {}, 1.))
+        motion = asyncio.create_task(f.gateway.request('move', '', dict(all_arms=True,targets=[dict(kind='named',name='home')]) ,1.))
         await eventually(lambda: any(p.check is not None for p in f.robot._pending))
-        stopped = await f.gateway.request('stop', '', {'arm_id':None}, .5)
+        stopped = await f.gateway.request('stop', '', {'all_arms':True}, .5)
         self.assertTrue(stopped.payload['success'])
         result = await motion
         self.assertEqual(409, result.status)
         self.assertFalse(f.robot._motion_uncertain)
         self.assertTrue(f.robot._recovery_required)
-        self.assertEqual(['reset_arms', 'stop'], [c[0] for c in f.driver.calls])
+        self.assertEqual(['prepare', 'move', 'stop'], [c[0] for c in f.driver.calls])
 
     async def test_clock_rollback_rejects_pending_capture_and_drops_old_evidence(self):
         f = await self.make_fixture()
@@ -235,9 +241,9 @@ class HardwareIntegrationTest(unittest.IsolatedAsyncioTestCase):
         f.driver.execute = execute
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(f.gateway,f.config)),
                                      base_url='http://test') as http:
-            response = await http.post('/v1/arms/reset', json={})
+            response = await http.post('/v1/move', json=dict(all_arms=True,targets=[dict(kind='named',name='home')]))
         self.assertEqual(200, response.status_code)
-        self.assertEqual([response.headers['x-request-id']], traces)
+        self.assertEqual([response.headers['x-request-id']]*2, traces)
 
     async def test_wrist_rgb_verification_works_without_tf_or_depth(self):
         f = await self.make_fixture('single_arm.json')

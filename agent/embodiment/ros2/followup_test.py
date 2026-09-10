@@ -3,6 +3,7 @@
 import asyncio
 from pathlib import Path
 import unittest
+from embodiment.ros2.test_requests import named_move
 from unittest import mock
 
 import httpx
@@ -25,13 +26,12 @@ class FollowupTest(unittest.IsolatedAsyncioTestCase):
 
   async def test_held_plan_manual_commands_require_recovery_for_each_topology(self):
     for filename in ('minimal.json', 'dual_arm.json'):
-      for name in ('move_arm', 'move_arms', 'set_gripper'):
+      for name in ('move', 'gripper'):
         with self.subTest(filename=filename, name=name):
           e = self.embodiment(filename)
           arm = e.config.arms[0].id
           e.manipulation.plans['p'] = dict(plan_id='p', state='picked', targets=[{'arm_id': arm}])
-          args = {'moves': [dict(POSE, arm_id=arm)]} if name == 'move_arms' else (
-              dict(arm_id=arm, opening=1.) if name == 'set_gripper' else dict(POSE, arm_id=arm))
+          args = dict(arm_ids=[arm], opening=1.) if name == 'gripper' else named_move(arm)
           e.robot._client.request = mock.AsyncMock(side_effect=AssertionError('Must not move held object'))
           self.assertFalse((await e.execute_action(name, **args))['success'])
           self.assertTrue(e.manipulation.needs_recovery)
@@ -41,7 +41,7 @@ class FollowupTest(unittest.IsolatedAsyncioTestCase):
 
   async def test_malformed_command_replies_and_failed_stop_require_recovery(self):
     for payload in ({}, {'success': 'true'}, [], {'success': False, 'error': 'Stop failed'}):
-      for name, args in [('move_arm', dict(POSE, arm_id='arm')), ('stop', {})]:
+      for name, args in [('move', named_move('arm')), ('stop', {})]:
         with self.subTest(payload=payload, name=name):
           e = self.embodiment(handler=lambda r: httpx.Response(200, json=payload))
           result = await e.execute_action(name, **args)
@@ -107,8 +107,8 @@ class FollowupTest(unittest.IsolatedAsyncioTestCase):
     async def workflow(*args, **kwargs):
       entered.set()
       await asyncio.Future()
-    e.robot.workflow = mock.AsyncMock(side_effect=workflow)
-    task = asyncio.create_task(e.execute_action('move_arms', moves=[dict(POSE, arm_id='arm')]))
+    e.robot.move = mock.AsyncMock(side_effect=workflow)
+    task = asyncio.create_task(e.execute_action('move', **named_move('arm')))
     await asyncio.wait_for(entered.wait(), 1.)
     task.cancel()
     with self.assertRaises(asyncio.CancelledError): await task
@@ -143,7 +143,7 @@ class FollowupTest(unittest.IsolatedAsyncioTestCase):
   async def test_repeated_call_id_terminates_session_without_replay(self):
     e = self.embodiment()
     s = self.session(e)
-    message = {'toolCall': {'functionCalls': [dict(id='same', name='move_arms', args={})]}}
+    message = {'toolCall': {'functionCalls': [dict(id='same', name='move', args={})]}}
     with mock.patch('session_manager.SessionManager._on_message') as accept:
       s._on_message(message)
       s._on_message(message)
@@ -168,7 +168,7 @@ class FollowupTest(unittest.IsolatedAsyncioTestCase):
     s = self.session(e)
     e.poller.wait_for_next_frame = mock.AsyncMock(return_value=jpeg())
     old_revision = e.observation_revision
-    await e.execute_action('move_arm',arm_id='arm',**POSE)
+    await e.execute_action('move', **named_move('arm'))
     await s.send_latest_video_frame()
     message = {'toolResponse': {'functionResponses': [dict(id='old',name='get_robot_state',
         response=dict(arms=[],observation_revision=old_revision))]}}

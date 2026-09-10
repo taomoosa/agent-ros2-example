@@ -67,7 +67,7 @@ class ToolReviewIntegrationTest(unittest.IsolatedAsyncioTestCase):
             failed = False
             async def fail_once(request,response):
                 nonlocal failed
-                if request.operation == 'execute_plan' and json.loads(request.payload_json)['stage'] == 'pick' and not failed:
+                if request.operation == 'gripper' and json.loads(request.payload_json).get('phase') == 'close' and not failed:
                     failed = True
                     self.fixture.driver.reply_status = 409
                     self.fixture.driver.reply_payload = dict(success=False,error='Transient jaw jam',
@@ -105,8 +105,9 @@ class ToolReviewIntegrationTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual('close',responses['pick0']['failed_phase'])
             self.assertTrue(responses['recover']['success'])
             self.assertNotEqual(responses['detect0']['plan_id'],responses['detect1']['plan_id'])
-            self.assertEqual(['reset_arms','execute_plan','stop','recover_arms','execute_plan','execute_plan'],
-                             [c[0] for c in self.fixture.driver.calls])
+            self.assertEqual([None,'lift',None,'lift','retreat'],
+                [c[2]['steps'][-1].get('phase') for c in self.fixture.driver.calls if c[0]=='prepare'])
+            self.assertEqual(1,sum(c[0]=='recover' for c in self.fixture.driver.calls))
         else:
             self.assertTrue(all(r.get('success',True) for r in responses.values()))
 
@@ -125,7 +126,7 @@ class ToolReviewIntegrationTest(unittest.IsolatedAsyncioTestCase):
             self.fixture.driver.publish()
             await eventually(lambda: (self.fixture.robot.store._arms['arm'][0].get('fault') if component == 'arm'
                 else self.fixture.robot.store._arms['arm'][0]['gripper'].get('fault')) == fault)
-            response = await self.http.post('/v1/arms/arm/pose',json=dict(frame_id='world',position=[0.,0.,1.],orientation=[0.,0.,0.,1.]))
+            response = await self.http.post('/v1/move', json=dict(arm_ids=['arm'], targets=[dict(kind='pose', **dict(frame_id='world',position=[0.,0.,1.],orientation=[0.,0.,0.,1.]))]))
             self.assertEqual(409,response.status_code)
             await self.http.post('/v1/stop',json={})
             recovered = await self.http.post('/v1/arms/recover')
@@ -143,7 +144,8 @@ class ToolReviewIntegrationTest(unittest.IsolatedAsyncioTestCase):
         await self.http.post('/v1/stop',json={})
         result = await self.http.post('/v1/arms/recover')
         self.assertTrue(result.json()['success'])
-        self.assertEqual(['secure_or_support_payload','release','retreat','home'],self.fixture.driver.calls[-1][2]['phases'])
+        self.assertEqual('recover',self.fixture.driver.calls[-1][0])
+        self.assertEqual(['arm'],self.fixture.driver.calls[-1][2]['arm_ids'])
         await eventually(lambda: self.fixture.robot.store._arms['arm'][0].get('fault') is None)
         self.assertFalse((await self.http.get('/v1/state')).json()['recovery_required'])
 

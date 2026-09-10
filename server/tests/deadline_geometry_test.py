@@ -44,8 +44,8 @@ class DeadlineGeometryTest(unittest.IsolatedAsyncioTestCase):
     async def test_queued_request_expired_before_dispatch_never_moves(self):
         f=await self.fixture()
         import json
-        future=f.gateway.client.call_async(RobotRequest.Request(operation='move_arm',resource_id='arm',
-            payload_json=json.dumps(POSE),timeout_sec=10.,deadline_ns=f.robot.get_clock().now().nanoseconds-1))
+        future=f.gateway.client.call_async(RobotRequest.Request(operation='move',resource_id='',
+            payload_json=json.dumps(dict(arm_ids=['arm'],targets=[dict(kind='pose',**POSE)])),timeout_sec=10.,deadline_ns=f.robot.get_clock().now().nanoseconds-1))
         await eventually(future.done)
         result=Reply.from_ros(future.result())
         self.assertEqual('request_expired',result.payload['code'])
@@ -55,19 +55,23 @@ class DeadlineGeometryTest(unittest.IsolatedAsyncioTestCase):
     def test_shared_budgets_include_settling_measurement_and_delivery(self):
         c=config('minimal.json')
         timing=Timing.from_server(c.server.model_dump())
-        for op,payload in [('move_arm',dict(duration=60.)),('move_arms',dict(moves=[dict(duration=60.)])),
-            ('set_gripper',{}),('execute_plan',{}),('reset_arms',{}),('recover_arms',{}),('stop',{}),('capture',{}),('state',{})]:
+        for op,payload in [('move',dict(duration=60.)),
+            ('gripper',{}),('execute_plan',{}),('recover_arms',{}),('stop',{}),('capture',{}),('state',{})]:
             self.assertEqual(c.server.operation_timeout(op,payload),timing.operation_timeout(op,payload))
-        self.assertGreater(c.server.operation_timeout('move_arms',dict(moves=[dict(duration=60.)])),60.+c.server.state_completion_timeout)
+        self.assertGreater(c.server.operation_timeout('move',dict(duration=60.)),60.+c.server.state_completion_timeout)
         self.assertEqual(c.server.stop_timeout,timing.operation_timeout('stop'))
         self.assertGreater(timing.observation_timeout,2*timing.camera_timeout)
+        c.server.motion_timeout=1.
+        timing=Timing.from_server(c.server.model_dump())
+        self.assertEqual(81.,c.server.operation_timeout('move',dict(duration=60.)))
+        self.assertEqual(81.,timing.operation_timeout('move',dict(duration=60.)))
 
     async def test_post_ack_motion_can_settle_within_dwell_budget(self):
         f=await self.fixture()
         f.config.server.settling_dwell=.1
         f.config.server.state_completion_timeout=1.
         f.driver.hold_moves=True
-        task=asyncio.create_task(f.gateway.request('move_arm','arm',POSE,2.))
+        task=asyncio.create_task(f.gateway.request('move', '', dict(arm_ids=['arm'], targets=[dict(kind='pose', **POSE)]) ,2.))
         await eventually(lambda:bool(f.driver.held))
         f.driver.states['arm']['moving']=True
         f.driver.release(True)
@@ -81,7 +85,7 @@ class DeadlineGeometryTest(unittest.IsolatedAsyncioTestCase):
         f=await self.fixture()
         f.config.server.state_completion_timeout=.15
         f.driver.hold_moves=True
-        task=asyncio.create_task(f.gateway.request('move_arm','arm',POSE,.5))
+        task=asyncio.create_task(f.gateway.request('move', '', dict(arm_ids=['arm'], targets=[dict(kind='pose', **POSE)]) ,.5))
         await eventually(lambda:bool(f.driver.held))
         f.driver.states['arm']['moving']=True
         f.driver.release(True)
@@ -89,7 +93,7 @@ class DeadlineGeometryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual('post_command_state_timeout',result.payload['code'])
         self.assertEqual('unknown',result.payload['outcome'])
         self.assertTrue(f.robot._recovery_required)
-        self.assertTrue((await f.gateway.request('stop','',{'arm_id':None},1.)).payload['success'])
+        self.assertTrue((await f.gateway.request('stop','',{'all_arms':True},1.)).payload['success'])
 
     def test_plan_and_capture_lifetimes_are_configured_not_refreshed(self):
         g=pixels_test.PixelProjectionTest();g.setUp()
@@ -190,7 +194,7 @@ class DeadlineGeometryTest(unittest.IsolatedAsyncioTestCase):
             f=await self.fixture()
             f.driver.hold_moves=True
             monitor=CompletionMonitor(POSE,policy=CompletionPolicy(dwell_sec=.08,max_sample_gap_sec=.2))
-            task=asyncio.create_task(f.gateway.request('move_arm','arm',POSE,2.))
+            task=asyncio.create_task(f.gateway.request('move', '', dict(arm_ids=['arm'], targets=[dict(kind='pose', **POSE)]) ,2.))
             await eventually(lambda:bool(f.driver.held))
             completed=False
             for _ in range(4):
@@ -208,7 +212,7 @@ class DeadlineGeometryTest(unittest.IsolatedAsyncioTestCase):
             if not reaches_target:
                 self.assertTrue(f.robot._recovery_required)
                 f.driver.hold_moves=False
-                self.assertTrue((await f.gateway.request('stop','',{'arm_id':None},1.)).payload['success'])
+                self.assertTrue((await f.gateway.request('stop','',{'all_arms':True},1.)).payload['success'])
                 recovered=await f.gateway.request('recover_arms','',{},1.)
                 self.assertTrue(recovered.payload['success'],recovered.payload)
                 self.assertFalse(f.robot._recovery_required)
@@ -241,7 +245,7 @@ class DeadlineGeometryTest(unittest.IsolatedAsyncioTestCase):
             return Reply(payload={'success':True})
         bridge=SimpleNamespace(config=c,get_logger=lambda:mock.Mock(),_workflow=delayed_workflow,
             pixels=mock.Mock(),_motion_uncertain=False,_recovery_required=False,_all_stopped=True)
-        request=RobotRequest.Request(operation='move_arm',resource_id='arm',payload_json=json.dumps(POSE),timeout_sec=1.)
+        request=RobotRequest.Request(operation='move',resource_id='',payload_json=json.dumps(dict(arm_ids=['arm'],targets=[dict(kind='pose',**POSE)])),timeout_sec=1.)
         with mock.patch('ros2_agent_server.robot_node.time.monotonic',side_effect=lambda:now[0]):
             response=await RobotBridgeNode._request(bridge,request,RobotRequest.Response())
         result=Reply.from_ros(response)

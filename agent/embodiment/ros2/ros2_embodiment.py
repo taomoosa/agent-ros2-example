@@ -17,7 +17,7 @@ from embodiment.ros2.manipulation import Manipulation
 
 
 # TOOL EXTENSION: classify motion here as well as dispatch; preserve stop/recovery guards.
-MOTION_TOOLS = frozenset({'move_arm', 'set_gripper', 'move_arms', 'reset_arms',
+MOTION_TOOLS = frozenset({'move', 'gripper', 'reset_arms',
                           'recover_arms', 'approach_targets', 'pick_targets', 'place_targets'})
 
 
@@ -155,19 +155,24 @@ class Ros2Embodiment(base.Embodiment):
       return self.task_result
     actions = {
         "get_robot_state": self.robot.get_robot_state,
-        "move_arm": self.robot.move_arm,
-        "set_gripper": self.robot.set_gripper,
         "stop": self.robot.stop,
+        "move": self.robot.move,
+        "gripper": self.robot.gripper,
     }
     actions.update({name: getattr(self.manipulation, name) for name in (
         'reset_arms', 'recover_arms', 'detect_targets', 'approach_targets', 'refine_grasp',
-        'pick_targets', 'inspect_grasp', 'verify_grasp', 'place_targets', 'move_arms')})
+        'pick_targets', 'inspect_grasp', 'verify_grasp', 'place_targets')})
     if action_name not in actions:
       raise ValueError(f"Unknown ROS2 action: {action_name}")
     try:
-      if action_name in {'move_arm', 'set_gripper'} and self.manipulation.needs_recovery:
+      if action_name == 'move':
+        targets = kwargs.get('targets')
+        if not isinstance(targets, list) or not targets or any(
+            not isinstance(target, dict) or target.get('kind') not in {'pixel', 'named'} for target in targets):
+          raise ValueError('Gemini move targets must use pixel or named; direct pose targets are not exposed')
+      if action_name in {'move', 'gripper'} and self.manipulation.needs_recovery:
         raise ValueError('Recover arms before issuing another manual motion')
-      if action_name in {'stop', 'move_arm', 'set_gripper'}:
+      if action_name in {'stop', 'move', 'gripper'}:
         if any(p['state'] in {'picked', 'verified'} for p in self.manipulation.plans.values()):
           self.manipulation.needs_recovery = True
           self.manipulation.invalidate()

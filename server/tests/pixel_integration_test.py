@@ -138,9 +138,9 @@ class PixelIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual('verified',verified.json()['state'])
         self.assertEqual('placed',(await self.http.post('/v1/plans/execute',json=body)).json()['state'])
         self.assertEqual(409,(await self.http.post('/v1/plans/execute',json=body)).status_code)
-        self.assertEqual(['pick','place'],[c[2]['stage'] for c in self.fixture.driver.calls])
-        self.assertEqual(['open','approach','descend','close','lift'],self.fixture.driver.calls[0][2]['phases'])
-        self.assertEqual(['left','right'],[t['arm_id'] for t in self.fixture.driver.calls[0][2]['targets']])
+        self.assertEqual(['lift','retreat'],[c[2]['steps'][-1]['phase'] for c in self.fixture.driver.calls if c[0]=='prepare'])
+        self.assertEqual(['open','approach','descend','close','lift'],[step['phase'] for step in self.fixture.driver.calls[0][2]['steps']])
+        self.assertEqual(['left','right'],self.fixture.driver.calls[0][2]['arm_ids'])
 
     async def test_stop_interrupts_group_and_prevents_late_success_or_retry(self):
         plan = await self.plan()
@@ -148,12 +148,12 @@ class PixelIntegrationTest(unittest.IsolatedAsyncioTestCase):
         body = dict(plan_id=plan['plan_id'],stage='pick')
         pending = asyncio.create_task(self.http.post('/v1/plans/execute',json=body))
         await eventually(lambda: bool(self.fixture.driver.held))
-        competing = await self.http.post('/v1/arms/reset')
+        competing = await self.http.post('/v1/move', json=dict(all_arms=True, targets=[dict(kind='named',name='home')]))
         self.assertEqual(409,competing.status_code)
         self.assertTrue((await self.http.post('/v1/stop',json={})).json()['success'])
         self.assertFalse((await pending).json()['success'])
         self.assertEqual(409,(await self.http.post('/v1/plans/execute',json=body)).status_code)
-        self.assertEqual(['execute_plan','stop'],[c[0] for c in self.fixture.driver.calls])
+        self.assertEqual(['prepare','gripper','move','stop'],[c[0] for c in self.fixture.driver.calls])
 
     async def test_group_timeout_and_missing_coordination_ack_invalidate_plan(self):
         plan = await self.plan()
@@ -163,9 +163,9 @@ class PixelIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(502,response.status_code)
         self.assertEqual('unknown',response.json()['outcome'])
         self.assertEqual(409,(await self.http.post('/v1/plans/execute',json=body)).status_code)
-        self.assertEqual(409,(await self.http.post('/v1/arms/reset')).status_code)
-        await self.http.post('/v1/stop',json={'arm_id':'left'})
-        self.assertEqual(409,(await self.http.post('/v1/arms/reset')).status_code)
+        self.assertEqual(409,(await self.http.post('/v1/move', json=dict(all_arms=True, targets=[dict(kind='named',name='home')]))).status_code)
+        await self.http.post('/v1/stop',json={'arm_ids':['left']})
+        self.assertEqual(409,(await self.http.post('/v1/move', json=dict(all_arms=True, targets=[dict(kind='named',name='home')]))).status_code)
         await self.http.post('/v1/stop',json={})
         self.fixture.driver.confirm_coordination = True
         self.assertTrue((await self.http.post('/v1/arms/recover')).json()['success'])
@@ -178,16 +178,17 @@ class PixelIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_reset_and_explicit_dual_pose_are_single_group_requests(self):
         plan = await self.plan()
-        reset = await self.http.post('/v1/arms/reset')
+        reset = await self.http.post('/v1/move', json=dict(all_arms=True, targets=[dict(kind='named',name='home')]))
         self.assertTrue(reset.json()['success'])
         self.assertEqual(['left','right'],self.fixture.driver.calls[0][2]['arm_ids'])
         self.assertEqual(409,(await self.http.post('/v1/plans/execute',json=dict(plan_id=plan['plan_id'],stage='pick'))).status_code)
         moves = [dict(arm_id=arm,frame_id='world',position=[x,0.,1.],orientation=[0.,0.,0.,1.])
                  for arm,x in [('left',-.2),('right',.2)]]
-        response = await self.http.post('/v1/arms/poses',json=dict(moves=moves))
+        response = await self.http.post('/v1/move', json=dict(arm_ids=['left','right'],
+            targets=[dict(kind='pose',**{k:v for k,v in m.items() if k!='arm_id'}) for m in moves]))
         self.assertTrue(response.json()['success'])
-        self.assertEqual(['reset_arms','move_arms'],[c[0] for c in self.fixture.driver.calls])
-        self.assertEqual(2,len(self.fixture.driver.calls[1][2]['moves']))
+        self.assertEqual(['prepare','move','prepare','move'],[c[0] for c in self.fixture.driver.calls])
+        self.assertEqual(2,len(self.fixture.driver.calls[-1][2]['targets']))
 
     async def test_refinement_rejects_wrong_wrist_and_preserves_release(self):
         plan = await self.plan()
@@ -227,8 +228,8 @@ class PixelIntegrationTest(unittest.IsolatedAsyncioTestCase):
                      for r in m['toolResponse']['functionResponses']}
         self.assertFalse(responses['verify_grasp']['success'])
         self.assertFalse(responses['place_targets']['success'])
-        stages = [payload['stage'] for op,_,payload in self.fixture.driver.calls if op == 'execute_plan']
-        self.assertEqual(['approach','pick'],stages)
+        stages = [payload['steps'][-1].get('phase') for op,_,payload in self.fixture.driver.calls if op == 'prepare' and payload['steps'][-1].get('phase')]
+        self.assertEqual(['approach','lift'],stages)
         self.assertEqual('stop',self.fixture.driver.calls[-1][0])
         self.assertEqual('invalid',next(iter(self.fixture.robot.pixels.plans.values()))['state'])
 
@@ -270,11 +271,12 @@ class PixelIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.fixture.driver.images[capture["camera_id"]],raw)
                 self.assertNotIn("image_base64",capture)
         self.assertEqual(4,inspected)
-        self.assertEqual(['reset_arms']+['execute_plan']*5,[c[0] for c in self.fixture.driver.calls])
-        for operation, _, payload in self.fixture.driver.calls:
-            self.assertTrue(payload['coordinated'])
-            if operation == 'execute_plan':
-                self.assertEqual(2,len(payload['targets']))
+        prepared = [payload for operation,_,payload in self.fixture.driver.calls if operation=='prepare']
+        self.assertEqual([None,'approach','lift','retreat','lift','retreat'],[p['steps'][-1].get('phase') for p in prepared])
+        for payload in prepared:
+            self.assertEqual(['left','right'],payload['arm_ids'])
+            if payload['steps'][-1].get('phase'):
+                self.assertTrue(payload['coupled'])
         plans = list(self.fixture.robot.pixels.plans.values())
         self.assertEqual(['placed','placed'],[p['state'] for p in plans])
         refined = plans[0]['targets'][0]['grasp']

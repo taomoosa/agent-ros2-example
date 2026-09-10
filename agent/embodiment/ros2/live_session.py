@@ -6,7 +6,7 @@ from session_manager import SessionManager
 from embodiment.ros2.bounded_io import thread_call
 
 
-# TOOL EXTENSION: deliver original visual evidence before its response; see server/docs/extending.md.
+# TOOL EXTENSION: deliver original visual evidence before its response; see server/docs/primitive-adapter.md#adding-and-exposing-tools.
 
 class Ros2SessionManager(SessionManager):
   def __init__(self, *args, **kwargs):

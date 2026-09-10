@@ -219,13 +219,3 @@ class Manipulation:
     self.checkpoint(generation)
     result['assessment'] = observations
     return self.remember(result)
-
-  async def move_arms(self, moves):
-    if self.needs_recovery:
-      raise ValueError('Recover arms before issuing another manual motion')
-    if any(p['state'] in {'picked', 'verified'} for p in self.plans.values()):
-      self.needs_recovery = True
-      self.invalidate()
-      raise ValueError('Manual motion cannot discard a held-object plan; stop and recover')
-    self.invalidate()
-    return await self.robot.workflow('move_arms', moves=moves)

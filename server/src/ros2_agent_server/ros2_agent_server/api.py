@@ -10,8 +10,9 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 
-from .models import MoveArm, Gripper, Stop
-from .workflow import DetectPlan, RefinePlan, ExecutePlan, VerifyPlan, MoveArms
+from .models import Stop
+from .motion import Move, Grip
+from .workflow import DetectPlan, RefinePlan, ExecutePlan, VerifyPlan
 from .protocol import BridgeError, validate_request
 
 
@@ -62,7 +63,7 @@ def create_app(gateway, config):
         return JSONResponse(result.payload, status_code=result.status,
                             headers={"Cache-Control": "no-store"} if operation in {"capture", "observation"} else None)
 
-    # TOOL EXTENSION: add routes with shared validation; see server/docs/extending.md.
+    # TOOL EXTENSION: add routes with shared validation; see server/docs/primitive-adapter.md#adding-and-exposing-tools.
     @app.get("/v1/state")
     async def state():
         return await request("state")
@@ -71,17 +72,17 @@ def create_app(gateway, config):
     async def camera(camera_id: str):
         return await request("camera", camera_id, timeout=config.server.camera_timeout)
 
-    @app.post("/v1/arms/{arm_id}/pose")
-    async def move_arm(arm_id: str, body: MoveArm):
-        return await request("move_arm", arm_id, body.model_dump())
+    @app.post("/v1/move")
+    async def move(body: Move):
+        return await request('move', payload=body.model_dump())
 
-    @app.post("/v1/arms/{arm_id}/gripper")
-    async def gripper(arm_id: str, body: Gripper):
-        return await request("set_gripper", arm_id, body.model_dump())
+    @app.post("/v1/gripper")
+    async def grip(body: Grip):
+        return await request('gripper', payload=body.model_dump())
 
     @app.post("/v1/stop")
     async def stop(body: Stop):
-        return await request("stop", payload=body.model_dump())
+        return await request("stop", payload=body.model_dump(exclude_unset=True))
 
     @app.get("/v1/cameras/{camera_id}/capture")
     async def capture(camera_id: str):
@@ -117,16 +118,8 @@ def create_app(gateway, config):
         payload = validate_request(config, operation, "", payload)
         return await request(operation, payload=payload)
 
-    @app.post("/v1/arms/reset")
-    async def reset_arms(http_request: Request):
-        return await empty_command("reset_arms", http_request)
-
     @app.post("/v1/arms/recover")
     async def recover_arms(http_request: Request):
         return await empty_command("recover_arms", http_request)
-
-    @app.post("/v1/arms/poses")
-    async def move_arms(body: MoveArms):
-        return await request("move_arms", payload=body.model_dump())
 
     return app

@@ -7,7 +7,7 @@ import httpx
 from geometry_msgs.msg import TransformStamped
 from tf2_ros import StaticTransformBroadcaster
 
-from helpers import ROOT, RosFixture, eventually
+from helpers import ROOT, RosFixture, eventually, config
 from ros2_agent_server.models import RobotConfig
 from ros2_agent_server.api import create_app
 from ros2_agent_server.gateway import HttpGatewayNode
@@ -19,6 +19,7 @@ class RosNamesIntegrationTest(unittest.IsolatedAsyncioTestCase):
         from embodiment.ros2.config import RobotConfig as AgentConfig
         from embodiment.ros2.robot_client import Ros2RobotClient
         c = RobotConfig.load(ROOT/'server/configs/remapped.json')
+        c.server.hardware = config('minimal.json').server.hardware
         f = RosFixture(c)
         self.addCleanup(f.close)
         await f.ready()
@@ -55,6 +56,7 @@ class RosNamesIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_explicit_ros_arguments_override_json_names_in_both_nodes(self):
         c = RobotConfig.load(ROOT/'server/configs/remapped.json')
+        c.server.hardware = config('minimal.json').server.hardware
         f = RosFixture(c)
         self.addCleanup(f.close)
         await f.ready()

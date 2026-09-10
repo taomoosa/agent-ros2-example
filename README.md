@@ -24,7 +24,7 @@ frames on both sides.
 The [hardware integration guide](server/docs/integration.md) lists what to
 configure and implement for the server and ROS2 driver, including a one-arm,
 one-fixed-camera setup. [ROS topic/service overrides](server/docs/ros-names.md)
-are kept together in the configuration's `server.remappings` object. The [extension guide](server/docs/extending.md) maps new
+are kept together in the configuration's `server.remappings` object. The [extension guide](server/docs/primitive-adapter.md#adding-and-exposing-tools) maps new
 tools and ROS capabilities to the files, driver contracts and tests to update.
 
 ```bash
@@ -58,17 +58,17 @@ ROS2 projects pixels using registered depth and capture-time TF, or an offline
 calibrated plane for fixed cameras. [Plane projection](server/docs/plane-projection.md)
 uses `projection: "plane"` and needs no depth stream; its points must lie on the
 calibrated surface. `configs/planar.json` provides illustrative settings. A dual-arm plan moves both arms through coordinated
-phases in a single driver request per stage. The driver implements home poses,
-approach geometry, grasp orientation, motion planning and synchronized control.
+phases. The common server resolves pose/pixel/named
+targets and executes the phases through basic hardware hooks. See the
+[primitive adapter guide](server/docs/primitive-adapter.md) and
+[driver template](server/examples/primitive_driver.py) for the integration path.
+The hardware backend still implements controller planning and synchronized execution.
 See [pixel workflow and driver contract](docs/pixel-workflow.md) for tools,
-prompts, depth/plane geometry inputs and extension points. The
-[tool lifecycle guide](docs/tool-lifecycle.md) explains triggers, fault detection,
-controlled recovery/retries and external ER prompt files. The
-[tool outcome guide](docs/tool-results.md) maps every tool to its completion
-evidence and scenario tests.
+prompts, depth/plane geometry inputs and extension points. The [tool outcome guide](docs/tool-results.md) maps every tool to its triggers,
+completion evidence, recovery/retry rules and scenario tests.
 
-The metric `move_arm` / `move_arms` tools and `set_gripper` remain available
-for measured/manual operations. They invalidate unfinished pixel plans, but
+The agent exposes `move` and `gripper` with consistent `arm_ids`/`all_arms` selection.
+These tools support measured/manual operations. They invalidate unfinished pixel plans, but
 cannot discard a held-object plan; stop and recover before another motion.
 `finish_task` ends the application; a reported failure exits with status 1.
 An interrupted application, connection failure, or timeout triggers a stop
@@ -127,3 +127,10 @@ Search `HARDWARE INTEGRATION` and `TOOL EXTENSION` comments to find the relevant
 source boundaries. When the `RobotRequest` service definition changes, rebuild
 the ROS interface and its service consumers. State-only publishers use standard
 `std_msgs/msg/String` and do not depend on the custom service type.
+
+Named positions are advertised in `server.hardware.position_names` as
+`{"arm":{"home":"Initial position for task startup."}}`. Only the mechanism
+maps those names to actual positions, in its own format. Gemini's `move` tool
+accepts pixel or named targets; direct poses are reserved for programmatic HTTP
+clients. See [the plan arm-selection contract](docs/pixel-workflow.md#plan-arm-selection) for one-arm and coupled
+two-arm detection, pick and placement.

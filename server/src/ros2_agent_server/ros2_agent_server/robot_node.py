@@ -48,6 +48,10 @@ class RobotBridgeNode(Node):
         self.store = StateStore(config)
         self._last_motion_end_ns = 0
         self.pixels = PixelPlans(config)
+        from .motion import MotionCompiler
+        self.motion = MotionCompiler(config, self.pixels)
+        self._active_arm_ids = []
+        self._coupled_arm_ids = []
         self._calibration = {}
         self._calibration_keys = {}
         self._invalid_plane_cameras = set()
@@ -376,7 +380,7 @@ class RobotBridgeNode(Node):
 
     async def _command(self, operation, resource_id, payload, timeout, request_id=""):
         # HARDWARE INTEGRATION: implement the driver service, not this common guard.
-        # TOOL EXTENSION: classify new motions in _workflow; see server/docs/extending.md.
+        # TOOL EXTENSION: classify new motions in _workflow; see server/docs/primitive-adapter.md#adding-and-exposing-tools.
         if timeout <= 0:
             raise BridgeError(504, "Driver deadline already expired", outcome="not_started")
         event(self.get_logger(), "driver_send", request_id=request_id, operation=operation, resource=resource_id)
@@ -467,7 +471,7 @@ class RobotBridgeNode(Node):
             self.get_logger().error(f"Request failed: {exc}")
             reply = Reply.from_error(BridgeError(500, "Robot bridge request failed", outcome="unknown"))
         if reply.status < 400 and admitted is not None and time.monotonic() >= admitted:
-            if request.operation in {'move_arm', 'move_arms', 'set_gripper', 'execute_plan', 'reset_arms', 'recover_arms', 'stop'}:
+            if request.operation in {'execute_plan', 'recover_arms', 'stop', 'move', 'gripper'}:
                 self._motion_uncertain = self._recovery_required = True
                 self._all_stopped = False
                 self.pixels.invalidate()
@@ -481,6 +485,17 @@ class RobotBridgeNode(Node):
         event(self.get_logger(), "workflow_enter", request_id=request_id, operation=operation,
               generation=self._generation, busy=self._motion_busy, recovery=self._recovery_required)
         if operation == 'stop':
+            all_ids = [a.id for a in self.config.arms]
+            requested = payload['arm_ids']
+            actual = set(requested)
+            groups = [getattr(self, '_active_arm_ids', []), getattr(self, '_coupled_arm_ids', [])] + [
+                [t['arm_id'] for t in p['targets']] for p in self.pixels.plans.values()
+                if p['state'] in {'picked', 'verified', 'executing'}]
+            for group in groups:
+                if len(group) > 1 and actual.intersection(group):
+                    actual.update(group)
+            actual = [a for a in all_ids if a in actual]
+            driver_payload = dict(arm_ids=actual)
             self._generation += 1
             self._recovery_required = self._recovery_required or self._motion_busy or any(
                 p['state'] in {'picked', 'verified', 'executing'} for p in self.pixels.plans.values())
@@ -489,17 +504,22 @@ class RobotBridgeNode(Node):
             self._motion_uncertain = True
             self._all_stopped = False
             generation = self._generation
-            reply = await self._command(operation, resource_id, payload, max(0., deadline-time.monotonic()), request_id=request_id)
+            reply = await self._command(operation, resource_id, driver_payload, max(0., deadline-time.monotonic()), request_id=request_id)
             if generation != self._generation:
                 return Reply.from_error(BridgeError(409, 'Stop superseded by another stop', outcome='unknown'))
             if reply.status == 200 and reply.payload.get('success') is True:
-                if payload.get('arm_id') is None:
+                if reply.payload.get('coordinated') is not True or sorted(reply.payload.get('completed_arm_ids',[])) != sorted(actual):
+                    reply = Reply.from_error(BridgeError(502,'Stop did not confirm all affected arms',outcome='unknown'))
+            if reply.status == 200 and reply.payload.get('success') is True:
+                if set(actual) == set(all_ids):
                     self._motion_uncertain = False
                     self._all_stopped = True
                 else:
                     self._motion_uncertain = was_uncertain
             else:
                 self._motion_uncertain = True
+            reply.payload.update(requested_arm_ids=requested, stopped_arm_ids=actual if reply.status == 200 and reply.payload.get('success') is True else [],
+                                 affected_arm_ids=actual, plans_invalidated=True)
             return reply
         if self._motion_uncertain:
             raise BridgeError(409, 'Previous motion outcome is unknown; stop and inspect before another command')
@@ -518,7 +538,7 @@ class RobotBridgeNode(Node):
                                expect_grasp=all(o['success'] for o in payload['observations']))
             return Reply(payload=self.pixels.verify(**payload))
         plan = None
-        grouped = operation in {'execute_plan', 'reset_arms', 'move_arms', 'recover_arms'}
+        primitive_steps = None
         if operation == 'execute_plan':
             plan = self.pixels.get(payload['plan_id'])
             stage = payload['stage']
@@ -535,26 +555,34 @@ class RobotBridgeNode(Node):
                 if other is not plan and other['state'] != 'placed':
                     other['state'] = 'invalid'
             self.pixels.captures.clear()
+            _, primitive_steps = self.motion.compile(operation,resource_id,payload)
             plan['state'] = 'executing'
         else:
-            arm_ids = ([m['arm_id'] for m in payload['moves']] if operation == 'move_arms'
-                       else [a.id for a in self.config.arms])
-            if not grouped:
-                arm_ids = [resource_id]
+            arm_ids = [a.id for a in self.config.arms]
+            if operation in {'move','gripper'}:
+                from .motion import Move, Grip
+                arm_ids = (Move if operation == 'move' else Grip).model_validate(payload).selected(self.config)
             if operation == 'recover_arms' and not self._all_stopped:
                 raise BridgeError(409, 'Stop all arms successfully before recovery')
-            self._check_health(arm_ids, recovering=operation == 'recover_arms')
+            home_requested = (operation == 'move' and any(
+                t.get('kind') == 'named' and t.get('name') == 'home' for t in payload['targets']))
+            self._check_health(arm_ids, recovering=operation == 'recover_arms', expect_released=home_requested)
             if operation != 'recover_arms' and any(
                     p['state'] in {'picked', 'verified'} for p in self.pixels.plans.values()):
                 self._recovery_required = True
                 self.pixels.invalidate()
                 raise BridgeError(409, 'Manual motion cannot discard a held-object plan; stop and recover')
+            if operation != 'recover_arms':
+                _, primitive_steps = self.motion.compile(operation,resource_id,payload)
             self.pixels.invalidate()
-            if grouped:
-                payload = dict(payload, arm_ids=arm_ids, coordinated=True)
-                if operation == 'recover_arms':
-                    payload['phases'] = ['secure_or_support_payload', 'release', 'retreat', 'home']
+            if operation == 'recover_arms':
+                payload = dict(payload, arm_ids=arm_ids)
+        if primitive_steps is None:
+            _, primitive_steps = self.motion.compile(operation,resource_id,payload)
         generation = self._generation
+        self._active_arm_ids = list(arm_ids)
+        if operation == 'execute_plan' and len(arm_ids)>1:
+            self._coupled_arm_ids = list(arm_ids)
         self._motion_busy = True
         self._all_stopped = False
         completed_successfully = False
@@ -564,11 +592,13 @@ class RobotBridgeNode(Node):
                           remaining*.25)
             if remaining <= 0:
                 raise BridgeError(504, "Motion expired before driver dispatch", code="request_expired", outcome="not_started")
-            reply = await self._command(operation, resource_id, payload, remaining-reserve, request_id=request_id)
+            from .sequencer import execute
+            reply = await execute(self,primitive_steps,arm_ids,operation == 'execute_plan' and len(arm_ids)>1,
+                                  deadline-reserve,request_id,generation)
             if generation != self._generation:
                 return Reply.from_error(BridgeError(409, 'Motion interrupted; outcome requires inspection', outcome='unknown'))
             self._motion_uncertain = reply.status >= 500 or reply.payload.get('outcome') == 'unknown'
-            if grouped and reply.status == 200 and reply.payload.get('success') is True:
+            if reply.status == 200 and reply.payload.get('success') is True:
                 completed = reply.payload.get('completed_arm_ids')
                 if (reply.payload.get('coordinated') is not True or not isinstance(completed, list)
                         or any(not isinstance(arm, str) for arm in completed)
@@ -582,6 +612,8 @@ class RobotBridgeNode(Node):
                 self._check_health(arm_ids, expect_released=(operation == 'recover_arms' or
                     operation == 'execute_plan' and payload['stage'] == 'place'))
             completed_successfully = reply.status == 200 and reply.payload.get('success') is True
+            if completed_successfully and (operation == 'recover_arms' or operation == 'execute_plan' and stage == 'place'):
+                self._coupled_arm_ids = []
             if operation == 'recover_arms' and completed_successfully:
                 self._recovery_required = False
                 reply.payload['next_actions'] = ['get_robot_state', 'detect_targets']
@@ -598,6 +630,7 @@ class RobotBridgeNode(Node):
             event(self.get_logger(), "workflow_finished", request_id=request_id, operation=operation,
                   success=completed_successfully, generation=self._generation)
             self._motion_busy = False
+            self._active_arm_ids = []
             self._last_motion_end_ns = self.get_clock().now().nanoseconds
             if not completed_successfully:
                 self._recovery_required = True

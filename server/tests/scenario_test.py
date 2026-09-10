@@ -130,8 +130,7 @@ class ScenarioStream(MockGeminiStream):
                 return
             assert picked['state'] == 'picked'
             if self.scenario == 'manual_held' and cycle == 0:
-                moved = yield from self.ask('move_arms', moves=[dict(arm_id=a, frame_id='world',
-                    position=[0.,0.,.3], orientation=[0.,0.,0.,1.]) for a in self.arms])
+                moved = yield from self.ask('move', arm_ids=self.arms, targets=[dict(kind='named',name='ready')])
                 assert moved['success'] is False
                 premature = yield from self.ask('finish_task', success=True, summary='Incorrect early success')
                 assert premature['success'] is False
@@ -200,10 +199,10 @@ class ScenarioTest(unittest.IsolatedAsyncioTestCase):
                 if request.operation == 'stop' and scenario == 'stop_failure':
                     fixture.driver.calls.append((request.operation, request.resource_id, body))
                     return Reply(payload=dict(success=False,error='Stop not confirmed')).to_ros(response)
-                if request.operation == 'recover_arms' and scenario == 'unsupported_recovery':
+                if request.operation == 'recover' and scenario == 'unsupported_recovery':
                     fixture.driver.calls.append((request.operation, request.resource_id, body))
                     return Reply(status=501,payload=dict(success=False,error='Recovery unsupported',recoverable=False)).to_ros(response)
-                pick = request.operation == 'execute_plan' and body['stage'] == 'pick'
+                pick = request.operation == 'gripper' and body.get('phase') == 'close'
                 if pick and scenario == 'disconnect_motion':
                     fixture.driver.hold_moves = True
                     stream.on_done()
@@ -230,10 +229,10 @@ class ScenarioTest(unittest.IsolatedAsyncioTestCase):
                 if request.operation == 'stop':
                     fixture.driver.hold_moves = False
                 reply = await original(request,response)
-                if pick:
+                if request.operation == 'move' and body.get('phase') == 'lift':
                     color = 'gray' if scenario in ('reinspection','uncertain') else 'green'
                     for camera in fixture.config.cameras: fixture.driver.images[camera.id] = jpeg(color)
-                if request.operation=='execute_plan' and body['stage']=='place':
+                if request.operation=='move' and body.get('phase')=='retreat':
                     for camera in fixture.config.cameras:
                         fixture.driver.images[camera.id] = jpeg('red' if scenario=='placement_miss' else 'blue')
                 return reply
@@ -241,7 +240,12 @@ class ScenarioTest(unittest.IsolatedAsyncioTestCase):
             if scenario == 'motion_timeout':
                 original_request = fixture.gateway.request
                 async def short_deadline(operation,resource_id,payload,timeout):
-                    return await original_request(operation,resource_id,payload,.15 if operation=='execute_plan' else timeout)
+                    nonlocal injected
+                    if operation=='execute_plan' and not injected:
+                        injected=True
+                        fixture.driver.hold_moves=True
+                        timeout=.15
+                    return await original_request(operation,resource_id,payload,timeout)
                 fixture.gateway.request = short_deadline
             def hook(name,result):
                 if name=='reset_arms':
@@ -274,7 +278,7 @@ class ScenarioTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(1,client.return_value.create_stream.call_count)
                     self.assertTrue(any(c[0]=='stop' for c in fixture.driver.calls))
                     if scenario != 'disconnect_motion': self.assertFalse(er_calls)
-                    else: self.assertEqual(1, sum(c[0]=='execute_plan' for c in fixture.driver.calls))
+                    else: self.assertEqual(1, sum(c[0]=='gripper' and c[2].get('phase')=='close' for c in fixture.driver.calls))
                 else:
                     result = await run_application(AgentConfig.load(ROOT/'agent/configs'/topology),'Move block to tray',**kwargs)
                     if stream.failure: raise stream.failure
@@ -294,21 +298,21 @@ class ScenarioTest(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(stream.steps,40)
             calls=fixture.driver.calls
             if scenario in ('missing_depth','missing_state','invalid_reset','disconnect','duplicate'):
-                self.assertFalse(any(c[0]=='execute_plan' for c in calls))
+                self.assertFalse(any(c[0]=='prepare' and c[2]['steps'][-1].get('phase')=='lift' for c in calls))
             if scenario in ('stop_failure','recovery_limit'):
-                self.assertFalse(any(c[0]=='recover_arms' for c in calls))
+                self.assertFalse(any(c[0]=='recover' for c in calls))
             if scenario in ('uncertain','sensor_conflict','unrecoverable','unsupported_recovery'):
-                self.assertFalse(any(c[0]=='execute_plan' and c[2]['stage']=='place' for c in calls))
+                self.assertFalse(any(c[0]=='move' and c[2].get('phase')=='retreat' for c in calls))
             if scenario=='group_partial':
                 self.assertEqual(2,len(stream.plan_ids))
-                self.assertFalse(any(c[0]=='execute_plan' and c[2]['stage']=='place' and
-                                     c[2]['plan_id']==stream.plan_ids[0] for c in calls))
+                self.assertFalse(any(c[0]=='move' and c[2].get('phase')=='retreat' and calls.index(c) < next(i for i,v in enumerate(calls) if v[0]=='recover') for c in calls))
                 stops=[c for c in calls if c[0]=='stop']
                 self.assertTrue(stops)
-                self.assertIsNone(stops[0][2]['arm_id'])
-            if scenario=='manual_held': self.assertFalse(any(c[0]=='move_arms' for c in calls))
+                self.assertEqual(arms,stops[0][2]['arm_ids'])
+            if scenario=='manual_held':
+                self.assertEqual(1,sum(c[0]=='move' and 'phase' not in c[2] for c in calls))
             if scenario=='motion_timeout':
-                self.assertEqual(2,sum(c[0]=='execute_plan' and c[2]['stage']=='pick' for c in calls))
+                self.assertEqual(2,sum(c[0]=='prepare' and c[2]['steps'][-1].get('phase')=='lift' for c in calls))
             if scenario in ('er_invalid','er_coordinates','er_json','er_timeout'):
                 self.assertEqual(2,len(er_calls))
                 self.assertNotEqual(er_calls[0],er_calls[1])

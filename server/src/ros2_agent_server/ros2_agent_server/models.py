@@ -55,16 +55,9 @@ class PlaneCalibration(Model):
         return self
 
 
-class MoveArm(Pose):
-    duration: float = Field(default=3.0, ge=0.1, le=60.0)
-
-
-class Gripper(Model):
-    opening: float = Field(ge=0.0, le=1.0)
-
-
 class Stop(Model):
-    arm_id: str | None = None
+    arm_ids: list[str] | None = Field(default=None, min_length=1, max_length=2)
+    all_arms: bool = False
 
 
 class Fault(Model):
@@ -73,7 +66,7 @@ class Fault(Model):
     recoverable: bool = False
 
 
-class GripperState(Gripper):
+class GripperState(Model):
     opening: float | None = Field(default=None, ge=0.0, le=1.0)
     fault: Fault | None = None
     object_detected: bool | None = None
@@ -128,6 +121,7 @@ class Camera(Model):
 
 
 class Settings(RosNames):
+    hardware: dict = Field(default_factory=dict)
     motion_timeout: float = Field(default=120.0, gt=0.0, le=3600.0)
     settling_timeout: float = Field(default=15.0, gt=0.0, le=3600.0)
     bridge_processing_margin: float = Field(default=1.0, gt=0.0, le=3600.0)
@@ -158,13 +152,11 @@ class Settings(RosNames):
             return self.camera_timeout
         if operation == 'stop':
             return self.stop_timeout
-        if operation == 'move_arm':
-            execution = payload.get('duration', 3.)
-        elif operation == 'move_arms':
-            execution = max(self.motion_timeout, max(m.get('duration', 3.) for m in payload['moves']))
-        elif operation in {'execute_plan', 'reset_arms', 'recover_arms'}:
+        if operation == 'move':
+            execution = max(self.motion_timeout, payload.get('duration', 3.))
+        elif operation in {'execute_plan', 'recover_arms'}:
             execution = self.motion_timeout
-        elif operation == 'set_gripper':
+        elif operation == 'gripper':
             execution = self.gripper_timeout
         else:
             return self.request_timeout

@@ -37,7 +37,7 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
                     if asyncio.get_running_loop().time() >= deadline:
                         self.fail("HTTP server did not start")
                     await asyncio.sleep(0.05)
-                self.assertIn("/v1/arms/{arm_id}/pose", response.json()["paths"])
+                self.assertIn("/v1/move", response.json()["paths"])
                 response = await client.get("/v1/state")
                 self.assertEqual(503, response.status_code)
                 self.assertFalse(response.json()["success"])

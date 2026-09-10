@@ -6,6 +6,7 @@ import io
 import json
 from pathlib import Path
 import unittest
+from embodiment.ros2.test_requests import pose_move, named_move
 from unittest import mock
 
 import httpx
@@ -41,7 +42,7 @@ class MockRobot:
         return httpx.Response(503, json={"error": "camera disconnected"})
       color = "blue" if "wrist" in request.url.path else "red"
       return httpx.Response(200, content=jpeg(color), headers={"Content-Type": "image/jpeg"})
-    if request.url.path.endswith("/pose") and self.move_error:
+    if request.url.path.endswith("/move") and self.move_error:
       raise self.move_error("motion timed out", request=request)
     if request.url.path == "/v1/state":
       return httpx.Response(200, json={"arms": [{"id": "left"}, {"id": "right"}]})
@@ -110,18 +111,17 @@ class ClientTest(unittest.IsolatedAsyncioTestCase):
 
   async def test_arm_routing_payloads_and_stop(self):
     for arm_id in ["left", "right"]:
-      result = await self.client.move_arm(arm_id, "world", [0.1, 0.2, 0.3], [0, 0, 0, 1])
+      result = await self.client.move(**pose_move(arm_id=arm_id,frame_id="world",position=[0.1, 0.2, 0.3],orientation=[0, 0, 0, 1]))
       self.assertTrue(result["success"])
       request = self.backend.requests[-1]
-      self.assertEqual(f"/v1/arms/{arm_id}/pose", request.url.path)
-      self.assertEqual({"frame_id": "world", "position": [0.1, 0.2, 0.3],
-                        "orientation": [0, 0, 0, 1], "duration": 3}, json.loads(request.content))
-      await self.client.set_gripper(arm_id, 0.4)
-      self.assertEqual(f"/v1/arms/{arm_id}/gripper", self.backend.requests[-1].url.path)
-    await self.client.stop("left")
-    self.assertEqual({"arm_id": "left"}, json.loads(self.backend.requests[-1].content))
+      self.assertEqual("/v1/move", request.url.path)
+      self.assertEqual(pose_move(arm_id, "world", [0.1,0.2,0.3], [0,0,0,1]), json.loads(request.content))
+      await self.client.gripper(**dict(arm_ids=[arm_id], opening=0.4))
+      self.assertEqual("/v1/gripper", self.backend.requests[-1].url.path)
+    await self.client.stop(arm_ids=["left"])
+    self.assertEqual({"arm_ids": ["left"]}, json.loads(self.backend.requests[-1].content))
     await self.client.stop()
-    self.assertEqual({"arm_id": None}, json.loads(self.backend.requests[-1].content))
+    self.assertEqual({"all_arms": True}, json.loads(self.backend.requests[-1].content))
 
   async def test_invalid_motion_never_reaches_server(self):
     good = {"arm_id": "left", "frame_id": "world", "position": [0, 0, 0],
@@ -131,23 +131,23 @@ class ClientTest(unittest.IsolatedAsyncioTestCase):
                       {"orientation": [0, 0, 0, 0]}, {"duration": -1},
                       {"duration": float("inf")}, {"duration": True}]:
       with self.subTest(overrides=overrides), self.assertRaises(ValueError):
-        await self.client.move_arm(**(good | overrides))
+        await self.client.move(**pose_move(**good | overrides))
     for opening in [-0.1, 1.1, float("nan"), True]:
       with self.assertRaises(ValueError):
-        await self.client.set_gripper("left", opening)
+        await self.client.gripper(**dict(arm_ids=["left"], opening=opening))
     self.assertEqual([], self.backend.requests)
 
   async def test_timeout_is_not_retried(self):
     self.backend.move_error = httpx.ReadTimeout
     with self.assertRaises(httpx.ReadTimeout):
-      await self.client.move_arm("left", "world", [0, 0, 0], [0, 0, 0, 1])
+      await self.client.move(**pose_move(arm_id="left",frame_id="world",position=[0, 0, 0],orientation=[0, 0, 0, 1]))
     self.assertEqual(1, len(self.backend.requests))
 
   async def test_asynchronous_acceptance_is_not_completion(self):
     client = Ros2RobotClient(self.config, transport=httpx.MockTransport(
         lambda request: httpx.Response(202, json={"success": True})))
     try:
-      result = await client.set_gripper("left", 0.5)
+      result = await client.gripper(**dict(arm_ids=["left"], opening=0.5))
       self.assertFalse(result["success"])
       self.assertEqual("unknown", result["outcome"])
     finally:
@@ -214,10 +214,8 @@ class ApplicationTest(unittest.IsolatedAsyncioTestCase):
         config = RobotConfig.load(CONFIGS / filename)
         backend = MockRobot()
         calls = [
-            {"id": "move-1", "name": "move_arm", "args": {
-                "arm_id": arm, "frame_id": "world", "position": [0.1, 0, 0.3],
-                "orientation": [0, 0, 0, 1]}},
-            {"id": "grip-1", "name": "set_gripper", "args": {"arm_id": arm, "opening": 0}},
+            {"id": "move-1", "name": 'move', "args": named_move(arm)},
+            {"id": "grip-1", "name": 'gripper', "args": dict(arm_ids=[arm],opening=0)},
             {"id": "state-final", "name": "get_robot_state", "args": {}},
             {"id": "done-1", "name": "finish_task", "args": {"success": True, "summary": "Done"}},
         ]
@@ -234,10 +232,10 @@ class ApplicationTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("flange", setup["systemInstruction"]["parts"][0]["text"])
         declarations = {item["name"]: item for item in setup["tools"][0]["functionDeclarations"]}
         self.assertEqual([a.id for a in config.arms],
-            declarations["move_arm"]["parameters"]["properties"]["arm_id"]["enum"])
+            declarations["move"]["parameters"]["properties"]["arm_ids"]["items"]["enum"])
         responses = [m["toolResponse"]["functionResponses"][0] for m in stream.messages if "toolResponse" in m]
         self.assertEqual(["move-1", "grip-1", "state-final", "done-1"], [r["id"] for r in responses])
-        move_index = backend.history.index(("http", "POST", f"/v1/arms/{arm}/pose"))
+        move_index = backend.history.index(("http", "POST", "/v1/move"))
         response_index = next(i for i, entry in enumerate(backend.history)
             if entry[0] == "gemini" and "toolResponse" in entry[1])
         between = backend.history[move_index + 1:response_index]
@@ -250,8 +248,7 @@ class ApplicationTest(unittest.IsolatedAsyncioTestCase):
     backend = MockRobot()
     backend.move_error = httpx.ReadTimeout
     stream = MockGeminiStream(backend.history, [
-        {"id": "1", "name": "move_arm", "args": {"arm_id": "arm", "frame_id": "world",
-         "position": [0, 0, 0], "orientation": [0, 0, 0, 1]}},
+        {"id": "1", "name": 'move', "args": named_move("arm")},
         {"id": "2", "name": "finish_task", "args": {"success": False, "summary": "Motion outcome unknown"}},
     ])
     with mock.patch("model.live_api_client.GeminiLiveApiClient") as client:
@@ -262,7 +259,7 @@ class ApplicationTest(unittest.IsolatedAsyncioTestCase):
     response = next(m["toolResponse"]["functionResponses"][0]["response"]
                     for m in stream.messages if "toolResponse" in m)
     self.assertEqual("unknown", response["outcome"])
-    self.assertEqual(1, sum(r.url.path.endswith("/pose") for r in backend.requests))
+    self.assertEqual(1, sum(r.url.path.endswith("/move") for r in backend.requests))
 
   async def test_application_timeout_stops_arms_and_closes_stream(self):
     config = RobotConfig.load(CONFIGS / "single_arm.json")
@@ -298,7 +295,7 @@ class ApplicationTest(unittest.IsolatedAsyncioTestCase):
         await run_application(config, "Inspect", model="mock", api_key="key",
             transport=httpx.MockTransport(backend))
       client.assert_not_called()
-    self.assertFalse(any(request.url.path.endswith("/pose") for request in backend.requests))
+    self.assertFalse(any(request.url.path.endswith("/move") for request in backend.requests))
 
   async def test_motion_serialization_does_not_block_stop(self):
     config = RobotConfig.load(CONFIGS / "dual_arm.json")
@@ -308,7 +305,7 @@ class ApplicationTest(unittest.IsolatedAsyncioTestCase):
     stops = []
 
     async def handler(request):
-      if request.url.path.endswith("/pose"):
+      if request.url.path.endswith("/move"):
         moves.append(request.url.path)
         first_started.set()
         await release.wait()
@@ -319,22 +316,22 @@ class ApplicationTest(unittest.IsolatedAsyncioTestCase):
     embodiment = Ros2Embodiment(config, transport=httpx.MockTransport(handler))
     self.addAsyncCleanup(embodiment.close)
     args = {"frame_id": "world", "position": [0, 0, 0], "orientation": [0, 0, 0, 1]}
-    first = asyncio.create_task(embodiment.execute_action("move_arm", arm_id="left", **args))
+    first = asyncio.create_task(embodiment.execute_action('move', **named_move("left")))
     await first_started.wait()
-    second = asyncio.create_task(embodiment.execute_action("move_arm", arm_id="right", **args))
+    second = asyncio.create_task(embodiment.execute_action('move', **named_move("right")))
     try:
       await asyncio.wait_for(embodiment.execute_action("stop"), timeout=0.5)
       self.assertEqual(["/v1/stop"], stops)
-      self.assertEqual(["/v1/arms/left/pose"], moves)
+      self.assertEqual(["/v1/move"], moves)
     finally:
       release.set()
       await asyncio.gather(first, second)
-    self.assertEqual(["/v1/arms/left/pose"], moves)
+    self.assertEqual(["/v1/move"], moves)
     self.assertFalse(first.result()['success'])
     self.assertFalse(second.result()['success'])
     self.assertFalse((await embodiment.execute_action("finish_task", success=True, summary="Done"))['success'])
     await embodiment.execute_action("finish_task", success=False, summary="Stopped; recovery required")
-    result = await embodiment.execute_action("move_arm", arm_id="left", **args)
+    result = await embodiment.execute_action('move', **named_move("left"))
     self.assertFalse(result["success"])
     self.assertEqual(1, len(moves))
 

@@ -50,10 +50,10 @@ For a shared object, include both arms in ONE detection plan and use it through
 pick, assessment and place. The driver synchronizes all phases, including close,
 lift and release. Never split a shared-object lift into independent arm calls.
 
-move_arm, move_arms and set_gripper are for explicitly requested, measured manual
+The advertised manual motion tools (move and gripper) are for explicitly requested, measured manual
 operations. They invalidate pixel plans. Positions are metres, orientations are
-unit xyzw quaternions; the driver owns tool offsets, orientation, approach geometry,
-collision checks, speed/force limits and recovery poses. Do not infer sensor values
+unit xyzw quaternions. The common server supplies TCP goals for pixel manipulation. The driver owns
+TCP calibration, named-position coordinates, collision checks, speed/force limits and recovery. Do not infer sensor values
 that the state does not provide. A successful driver response is completion of a
 stage, not proof of task success.
 
@@ -77,3 +77,32 @@ Outcome evidence:
 - Manual motion cannot discard a held-object plan. Use stop and recover_arms.
 - Stop failures and unknown outcomes require operator attention if recovery cannot
   complete. A disconnected session must not resume old tool calls or plans.
+
+move/gripper/stop select arm_ids or all_arms=true exclusively.
+move accepts only pixel (bound capture_id plus tabletop profile) or configured
+named targets. Choose a name using its advertised description; its coordinates
+and format belong to the mechanism. Direct pose specification is not available
+to you. Never invent capture IDs or named positions. Named
+home is for startup without held objects or unresolved failures. Stop may expand
+a partial request to a coupled group; inspect stopped_arm_ids and recovery state.
+
+## Plan arm selection
+
+`detect_targets(camera_id, instruction, arm_ids)` explicitly selects the plan's
+participants. In a two-arm setup, `["left"]` or `["right"]` creates a one-arm
+plan; `["left", "right"]` creates a coupled two-arm plan. ER must return exactly
+one grasp/release pair per selected arm. `approach_targets`, `pick_targets` and
+`place_targets` take `plan_id` and act on **all and only that plan's arms**.
+They never implicitly include other configured arms, and cannot select a subset
+of an existing plan. To change participants, create a new plan after completing
+or safely recovering the current work.
+
+Both-arm plans require synchronized phases and shared-object constraints from
+the backend. They are not two independent pick operations; separate concurrent
+plans are not supported. `refine_grasp` updates one participating arm using its
+own wrist camera. Call `inspect_grasp` for each participant, then `verify_grasp`
+with exactly those arms. A one-arm plan needs only one assessment, including in
+a two-arm setup. All configured arms must keep publishing fresh telemetry. Motion health checks
+cover the selected arms; agent state observation and final task checks also
+consider faults on other configured arms. `reset_arms` and `recover_arms` always affect all
+configured arms; `stop` may expand to a coupled group.

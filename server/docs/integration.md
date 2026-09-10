@@ -13,20 +13,28 @@ All commands below run from the repository root in that environment.
 | Arm telemetry | Validated JSON subscription per arm | Publish current controller/gripper state through an adapter |
 | Camera inputs | JPEG, depth/CameraInfo/TF capture, or configured fixed-plane projection | Supply registered RGB-D and image-time TF for depth mode; for plane mode, supply the calibrated JPEG stream and offline coefficients |
 | Hardware commands | `RobotRequest` client and completion/failure checks | Implement a driver adapter service that calls your existing controllers, actions or MoveIt integration |
-| Physical manipulation | Group requests and phase descriptions | Implement home poses, TCP geometry, grasp orientation, clearances, limits, collision checking, synchronized execution and recovery in your driver |
+| Physical manipulation | Target compiler, TCP/tabletop policy and common phase executor | Configure task orientation/clearances and position_names in `server.hardware`; register named coordinates/TCP calibration and implement controller behavior in your backend |
 | Tests | Mock driver/Gemini with real ROS2 communication | Add tests for your adapter and validate its physical behavior on your system |
 
 The runtime does not start a hardware driver. [FakeDriver](../tests/helpers.py)
 is a test fixture, not a production driver or a hardware simulator launched by
 the server. Keep robot-specific integration in a separate ROS package whenever
 it can implement the existing topics and service. Tool extensions are covered
-in [Adding tools and ROS capabilities](extending.md). Measured String/JSON state and
+in [Adding tools and ROS capabilities](primitive-adapter.md#adding-and-exposing-tools). Measured String/JSON state and
 publisher updates are covered in [telemetry](telemetry.md); camera pairing, geometry
 aliases and diagnostic logs are covered in [synchronization](synchronization.md).
 
+For the smaller hardware integration surface, use
+[common primitive execution](primitive-adapter.md): configure `server.hardware`
+with task geometry and advertised position_names, then implement the basic
+hardware hooks. There is one execution path for all configurations.
+
 ## 1. Set the topology and connection settings
 
-For one fixed camera and one arm, start with this complete configuration:
+For one fixed camera and one arm, this topology is sufficient for observation.
+For homing and pixel manipulation, also configure task profiles and advertised
+position names using [hardware configuration](primitive-adapter.md#hardware-configuration),
+and register actual positions in the backend:
 
 ```json
 {
@@ -73,10 +81,9 @@ The `server` object is optional. The agent can load the same topology file.
 | `server.state_completion_timeout` | Wait for measured state after driver acknowledgement, greater than zero and at most 3600 seconds, default 5; also bounded by the original operation deadline |
 
 Frame IDs must be nonempty and have no leading slash. Mount declarations do not
-publish TF or calibrate cameras. Home poses, TCP offsets, grasp orientation,
-trajectory limits and recovery destinations belong in **your driver package's
-configuration**. There are no fields for them in this server configuration;
-unknown fields are rejected by [RobotConfig](../src/ros2_agent_server/ros2_agent_server/models.py).
+publish TF or calibrate cameras. Use `server.hardware.profiles` for tabletop task geometry and `position_names`
+for a name-to-description catalog without coordinates. Named coordinates, TCP calibration, controller limits
+and recovery belong to the backend; see its separate configuration example. Other unknown fields are rejected by [RobotConfig](../src/ros2_agent_server/ros2_agent_server/models.py).
 
 ## 2. Provide telemetry, images and capture geometry
 
@@ -119,7 +126,7 @@ Map the measured gripper range to `opening` in `0..1` (closed to open), or
 use null/omit the field if unavailable. The `gripper` object is required. Populate
 arm/gripper `fault` and `object_detected` from real controller/sensor data when
 available; use null for unavailable readings. See the
-[fault fields and recovery contract](../../docs/tool-lifecycle.md#failure-detection-and-controlled-retries).
+[fault fields and recovery contract](../../docs/tool-results.md#recovery-and-retry-limits).
 Repeated or older measurement stamps do not refresh state. Your adapter must
 detect upstream telemetry loss and never restamp cached values. JointState
 alone does not carry the full arm/gripper/fault contract. String JSON
@@ -165,54 +172,30 @@ the sourced server interface package. Your driver can live in its own workspace;
 if placed under `server/src/`, the README's colcon build discovers it. No changes
 to the generic server packages are needed for a conforming adapter.
 
-Use the [service definition](../src/ros2_agent_interfaces/srv/RobotRequest.srv)
-and implement the operations needed by your chosen application:
+Use the [driver template](../examples/primitive_driver.py), backed by
+`PrimitiveAdapter`. Implement these asynchronous `HardwareBackend` hooks:
 
-| Driver operation | `resource_id` / decoded `payload_json` | Required behavior |
+| Hook | Input | Required result |
 |---|---|---|
-| `move_arm` | Arm ID / `{frame_id, position, orientation, duration}` | Move the flange to a metric pose; resolve moving reference frames at request time |
-| `set_gripper` | Arm ID / `{opening}` | Operate the gripper and detect failure |
-| `stop` | Empty / `{arm_id: null}` for all, or a specific arm ID | Stop active motion even while another service request is pending |
-| `reset_arms` | Empty / `{arm_ids, coordinated: true}` | Home all listed arms for normal startup |
-| `move_arms` | Empty / `{moves, arm_ids, coordinated: true}` | Coordinate the requested flange poses; each move contains `arm_id` and the `move_arm` pose fields |
-| `execute_plan` | Empty / `{plan_id, stage, targets, phases, coordinated: true}` | Execute one coordinated approach, pick or place stage; derive participating arms from `targets` |
-| `recover_arms` | Empty / `{arm_ids, phases, coordinated: true}` | Secure/support any payload, release safely, retreat and home; recover only eligible faults |
+| `prepare` | All steps including TCP/flange/named goals, arm IDs, coupled flag, deadline/cancellation context | Validate the entire sequence and reserve controller resources before any motion |
+| `move` | TCP/flange poses or named goals, arm IDs, duration, coupled flag, context | Plan and execute the group; confirm every target from measured feedback |
+| `gripper` | Per-arm normalized openings, arm IDs, context | Operate and confirm every gripper; closed jaws alone do not prove a grasp |
+| `stop` | Resolved group arm IDs, context | Interrupt pending work and confirm actual stopping |
+| `recover` (optional) | Arm IDs, context | Support/release payload safely, clear eligible faults, retreat and home; fail explicitly if unsupported |
 
-For the supplied pick/place application, implement `stop`, `reset_arms`,
-`execute_plan` and `recover_arms`. Manual motion tools additionally need
-`move_arm`, `set_gripper` and `move_arms`. If an operation is unsupported, return
-an explicit failure; successful intent/acceptance is not completion.
+Hooks return `{"success": true}` only after their work completes. The adapter
+adds `coordinated: true` and `completed_arm_ids` to the ROS response. Declare
+only capabilities the controller actually supports. See the
+[full hook and sequence contract](primitive-adapter.md) for payloads, preflight,
+replay protection, joint targets and coupled motion constraints.
 
-Agent tool names are not necessarily driver operation names. `detect_targets`
-calls ER and creates a plan inside the bridge; it sends no detection command to
-the driver. `approach_targets`, `pick_targets` and `place_targets` all become
-`execute_plan`, with different stages. `state`, `camera`, `capture`,
-`observation`, `create_plan`, `refine_plan` and `verify_grasp` are handled
-inside the bridge.
-
-An `execute_plan` target contains `arm_id`, `grasp` and `release`. Each point
-contains `frame_id`, `position`, `capture_id`, `pixel` and `stamp_ns`. These are
-projected world **contact points**, not flange poses. Plane-derived points also
-include `projection: "plane"` and `calibration_id`; accept these provenance fields
-in your adapter. Plane points assume the selected surface lies on the calibration plane. Your driver supplies tool
-offsets, orientation, support/object offsets and approach clearance. The
-[coordinated driver contract](../../docs/pixel-workflow.md#coordinated-driver-contract)
-lists the exact phase arrays and dual-arm synchronization requirements. The
-bridge sends a group request; physical synchronization belongs to the driver.
-
-For completed `move_arm`, `set_gripper` or `stop`, return `status_code=200`,
-`content_type="application/json"`, empty `data` and this `payload_json`:
-
-```json
-{"success": true}
-```
-
-For `reset_arms`, `move_arms`, `execute_plan` and `recover_arms`, completion must
-list **every requested arm exactly once, even in a one-arm installation**:
-
-```json
-{"success": true, "coordinated": true, "completed_arm_ids": ["arm"]}
-```
+Detection and refinement call ER inside the agent. The bridge resolves frozen
+pixel geometry, maintains plans/evidence, and compiles approach/pick/place into
+primitive phases using configured tabletop geometry. The hardware
+backend receives TCP/flange poses or names, not images, pixels or `execute_plan` requests.
+`reset_arms` is an agent convenience for `/v1/move` with the named `home` target.
+`recover_arms` remains a separate workflow; a simple home move cannot recover a
+loaded or faulted mechanism.
 
 Report failures with `success: false` and `error`, optionally `code`,
 `failed_phase`, `failed_arm_ids`, `recoverable` and `outcome`. Use
@@ -250,7 +233,8 @@ curl --fail-with-body http://localhost:8080/v1/cameras/overhead/capture -o /tmp/
 
 Expect the service type `ros2_agent_interfaces/srv/RobotRequest`, matched topic
 endpoints/QoS, fresh state for every configured arm, a JPEG and capture JSON
-containing `capture_id`, `image_base64`, camera pose and acquisition timestamp.
+containing `capture_id`, `image_base64` and acquisition timestamp. Depth captures
+include camera pose; plane captures contain frozen `plane_calibration` instead.
 A successful state/image check does not establish that the driver or pixel
 geometry is ready; verify service presence and `/capture` separately.
 
@@ -288,8 +272,9 @@ this guide. The main integration points are:
 |---|---|
 | Camera fields in `models.py`, validation/projection in `pixels.py` | Declare actual input frames and pairing tolerance; supply upstream registration if the existing color-grid/color-Z contract is not met |
 | `models.py: ArmState`, `RobotBridgeNode._arm_state` | Publish measured controller/gripper data and map faults; see the telemetry guide |
-| `RobotBridgeNode._command` | Implement its service peer in your driver package: all seven operations listed above, actual completion and responsive stopping |
-| Your driver configuration | Home joint poses, TCP calibration, grasp orientation/offsets, paths, limits, coordinated execution and supported recovery |
+| `RobotBridgeNode._command` | Use `PrimitiveAdapter` with basic hardware hooks, actual completion and responsive stopping |
+| `motion.py` / `primitive_driver.py` / `examples/primitive_driver.py` | Common target/phase compilation and the hardware hook template; see [primitive integration](primitive-adapter.md) |
+| `server.hardware` / controller configuration | Keep tabletop offsets and position_names in shared settings; register actual named poses/joints and TCP calibration in the backend |
 | `ros_names.py: RosNames` | Central name definitions and remap validation; use `server.remappings` for hardware names instead of editing node constructors |
 | Package `setup.py` / `package.xml` | Install any added launch/config files, register entry points and declare actual adapter dependencies |
 

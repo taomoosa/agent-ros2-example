@@ -32,10 +32,9 @@ The bridge also accepts `settling_dwell` (default 0.2, range 0..10 seconds) and
 extra stationary dwell but still requires new post-acknowledgement telemetry.
 
 The bridge operation budget is execution + settling + post-state + processing
-margin. Single-arm execution uses `duration`; group moves use at least the
-largest requested duration and `motion_timeout`. With defaults, a 60-second
-single-arm move has an 81-second bridge budget and an 86-second agent budget.
-Group stages/reset/recovery have 141/146 seconds. Gripper requests have 36/41
+margin. Every move, including a single arm, uses the larger of `duration` and
+`motion_timeout` for execution. With defaults, moves, home, plan stages and
+recovery have a 141-second bridge budget and a 146-second agent budget. Gripper requests have 36/41
 seconds. Stop has 5/10 seconds. Recovery performs stop before the recovery
 request, so its total tool duration also includes that stop.
 
@@ -53,7 +52,7 @@ a long motion deadline. A timeout is not permission to replay a motion.
 
 `RobotRequest` now carries `deadline_ns` in the shared ROS clock in addition to
 `timeout_sec`. Rebuild **all** interface consumers, including the driver. Gateway
-queue/delivery time reduces the remaining execution allowance. Direct legacy
+queue/delivery time reduces the remaining execution allowance. Direct
 callers may leave `deadline_ns=0`; that only supplies a relative timeout starting
 at bridge admission. Internal relative requests are limited to (0,15000] seconds.
 Do not compare monotonic timestamps from different processes or hosts.
@@ -115,6 +114,11 @@ but the driver should acknowledge only after its own controller completion check
 [completion.py](../src/ros2_agent_server/ros2_agent_server/completion.py) provides
 an optional `CompletionMonitor` for driver adapters. Instantiate one per arm and
 new command, with target flange pose and an optional requested gripper opening.
+This helper compares against `measured_arm_state.flange_pose`. For a TCP
+command, the backend must first derive the corresponding flange target with
+its own calibrated transform, or use controller-native TCP completion feedback
+instead. Do not compare a TCP target directly against flange measurements.
+The common bridge performs no tool transform for this helper.
 Feed **measured** states and advancing acquisition times from one clock:
 
 ```python
@@ -152,3 +156,14 @@ RGB, depth, TF and state at separate jittered rates with delayed depth and dropo
 Test fixtures lease different ROS domains across processes. Agent `timing_test.py`
 covers slow cleanup/connect/send, idle models, camera lock contention, mock HTTP
 elapsed limits and a real TCP peer continuously sending small response chunks.
+
+
+## Common primitive execution
+
+`/v1/move` uses the group operation budget and `/v1/gripper` uses the
+gripper budget. The compiler resolves all goals before execution; the driver
+preflights the entire sequence. Every phase and its measured-state/dwell check
+spend the original remaining budget. No phase restarts the motion timeout.
+Failure initiates a group stop using the independent stop budget; this can make
+failure handling extend beyond the motion deadline. See
+[primitive sequence and stop semantics](primitive-adapter.md).

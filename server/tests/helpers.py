@@ -29,7 +29,8 @@ from std_msgs.msg import String
 
 from ros2_agent_server.gateway import HttpGatewayNode
 from ros2_agent_server.models import RobotConfig
-from ros2_agent_server.protocol import Reply
+from ros2_agent_server.protocol import Reply, BridgeError
+from ros2_agent_server.primitive_driver import PrimitiveAdapter, HardwareBackend
 from ros2_agent_server.robot_node import RobotBridgeNode
 from ros2_agent_server.runtime import spin_until_stopped
 
@@ -37,7 +38,12 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def config(name="single_arm.json"):
-    return RobotConfig.load(ROOT / "agent" / "configs" / name)
+    c = RobotConfig.load(ROOT / "agent" / "configs" / name)
+    c.server.hardware = {
+        'profiles': {a.id: dict(orientation=[0.,0.,0.,1.],
+            approach_m=.1, lift_m=.12, transfer_height_m=5.) for a in c.arms},
+        'position_names': {a.id: {'home':'Initial position.', 'ready':'Ready position.'} for a in c.arms}}
+    return c
 
 
 def jpeg(color="red"):
@@ -60,11 +66,116 @@ async def eventually(predicate, timeout=5.0):
         await asyncio.sleep(0.01)
 
 
+class MeasuredBackend(HardwareBackend):
+    coordinated_motion=coordinated_gripper=coupled_transfer=joint_targets=recovery=True
+
+    def __init__(self,node):
+        self.node=node
+        self.fail_phase=None
+        self.prepared=[]
+        self.motions=[]
+        self.stop_ids=[]
+        self.named_positions={a.id: {'home':dict(kind='pose',reference='flange',**arm_state()['flange_pose']),
+            'ready':dict(kind='pose',reference='tcp',frame_id='world',position=[.2,0.,.4],orientation=[0.,0.,0.,1.])}
+            for a in node.config.arms}
+        self.resolved_steps=[]
+
+    async def prepare(self,steps,ids,coupled,context):
+        context.check()
+        resolved=copy.deepcopy(steps)
+        for step in resolved:
+            if step['operation'] != 'move':
+                continue
+            goals=[]
+            for arm,target in zip(ids,step['targets']):
+                if target['kind']=='named':
+                    if target['name'] not in self.named_positions.get(arm,{}):
+                        raise BridgeError(422,f'Backend has no named position {target["name"]!r} for arm {arm!r}')
+                    target=copy.deepcopy(self.named_positions[arm][target['name']])
+                if target['kind']=='joints' and not self.joint_targets:
+                    raise BridgeError(501,'Backend joint targets are unsupported')
+                goals.append(target)
+            step['targets']=goals
+        self.prepared=steps
+        self.resolved_steps=resolved
+        self.node.phase_index=0
+        return dict(success=True)
+
+    def result(self):
+        if self.node.reply_status >= 400:
+            error = BridgeError(self.node.reply_status, self.node.reply_payload.get('error','Injected driver failure'))
+            error.payload.update(self.node.reply_payload)
+            raise error
+        if self.node.reply_status != 200:
+            raise BridgeError(502,'Driver did not return completed operation',outcome='unknown')
+        return copy.deepcopy(self.node.reply_payload)
+
+    async def move(self,targets,ids,duration,coupled,context):
+        context.check()
+        result = self.result()
+        if result.get('success') is not True:
+            return result
+        self.motions.append(copy.deepcopy(targets))
+        if self.node.hold_moves:
+            future=Future(executor=self.node.executor)
+            self.node.held.append(future)
+            if not await future:
+                return dict(success=False,error='Stopped during motion',outcome='unknown')
+        step=self.prepared[self.node.phase_index]
+        self.node.phase_index+=1
+        if self.fail_phase is not None and self.fail_phase==step.get('phase'):
+            return dict(success=False,error='Measured target not reached',code='arrival_failed')
+        for arm,target in zip(ids,self.resolved_steps[self.node.phase_index-1]['targets']):
+            if target['kind']=='pose':
+                measured={k:copy.deepcopy(target[k]) for k in ('frame_id','position','orientation')}
+                if target.get('reference')=='tcp':
+                    # Test-only calibration belongs to this mock mechanism.
+                    from ros2_agent_server.pixels import transform_point
+                    offset=transform_point([0.,0.,.05],dict(position=[0.,0.,0.],orientation=target['orientation']))
+                    measured['position']=[v-o for v,o in zip(measured['position'],offset)]
+                measured['position'][0]+=.0001
+                self.node.states[arm]['flange_pose']=measured
+        self.node.publish()
+        context.check()
+        return dict(success=True)
+
+    async def gripper(self,openings,ids,context):
+        context.check()
+        result = self.result()
+        if result.get('success') is not True:
+            return result
+        step=self.prepared[self.node.phase_index]
+        self.node.phase_index+=1
+        if self.fail_phase is not None and self.fail_phase==step.get('phase'):
+            return dict(success=False,error='Gripper jammed')
+        for arm,opening in zip(ids,openings):
+            self.node.states[arm]['gripper']=dict(opening=opening,object_detected=(opening<.5 if step.get('phase') else None))
+        self.node.publish()
+        return dict(success=True)
+
+    async def stop(self,ids,context):
+        self.stop_ids.append(ids)
+        self.node.release(False)
+        return dict(success=True)
+
+    async def recover(self,ids,context):
+        context.check()
+        result = self.result()
+        if result.get('success') is not True:
+            return result
+        self.fail_phase=None
+        for arm in ids:self.node.states[arm]=dict(arm_state(),fault=None)
+        self.node.publish()
+        return dict(success=True)
+
+
 class FakeDriver(Node):
     def __init__(self, robot_config, **kwargs):
         super().__init__("test_driver", **robot_config.server.node_options(kwargs))
         self.config = robot_config
         self.calls = []
+        self.backend = MeasuredBackend(self)
+        self.adapter = PrimitiveAdapter(robot_config,self.backend,lambda:self.get_clock().now().nanoseconds)
         self.publish_images = True
         self.publish_states = True
         self.publish_geometry = True
@@ -163,43 +274,15 @@ class FakeDriver(Node):
                     self.idle.set()
 
     async def execute(self, request, response):
-        payload = json.loads(request.payload_json)
-        with self._lock:
-            self.calls.append((request.operation, request.resource_id, payload))
-            if request.operation == "stop":
-                self.release(False)
-                return Reply(payload={"success": True}).to_ros(response)
-            if request.operation in {"move_arm", "execute_plan", "move_arms", "reset_arms", "recover_arms"} and self.hold_moves:
-                future = Future(executor=self.executor)
-                self.held.append(future)
-            else:
-                future = None
-        if future is not None:
-            completed = await future
-            return Reply(payload={"success": completed, "message": "Completed" if completed else "Stopped"}).to_ros(response)
-        with self._lock:
-            if self.reply_status == 200 and self.reply_payload.get("success"):
-                if request.operation == "move_arm":
-                    self.states[request.resource_id]["flange_pose"] = {
-                        key: payload[key] for key in ("frame_id", "position", "orientation")}
-                if request.operation == "set_gripper":
-                    self.states[request.resource_id]["gripper"] = payload
-        if request.operation == 'execute_plan' and self.reply_status == 200 and self.reply_payload.get('success'):
-            for target in payload['targets']:
-                gripper = self.states[target['arm_id']]['gripper']
-                if payload['stage'] in {'pick', 'place'}:
-                    gripper['object_detected'] = payload['stage'] == 'pick'
-            self.publish()
-        if request.operation == 'recover_arms' and self.reply_status == 200 and self.reply_payload.get('success'):
-            for state in self.states.values():
-                state['fault'] = None
-                state['gripper'] = {'opening': 1.0, 'fault': None, 'object_detected': False}
-            self.publish()
-        result = dict(self.reply_payload)
-        if payload.get('coordinated') and self.confirm_coordination:
-            result.update(coordinated=True, completed_arm_ids=payload.get('arm_ids',
-                [t['arm_id'] for t in payload.get('targets', [])]))
-        return Reply(status=self.reply_status, payload=result).to_ros(response)
+        self.calls.append((request.operation, request.resource_id, json.loads(request.payload_json)))
+        result = await self.adapter.handle(request, response)
+        # Fault injection exercises malformed/partial peer acknowledgements, not
+        # an alternate driver implementation or a fake high-level plan executor.
+        if not self.confirm_coordination and request.operation != 'stop':
+            body = json.loads(result.payload_json)
+            body.pop('coordinated', None)
+            result.payload_json = json.dumps(body)
+        return result
 
     def release(self, success=True):
         with self._lock:
@@ -210,7 +293,7 @@ class FakeDriver(Node):
 
 
 class RosFixture:
-    def __init__(self, robot_config):
+    def __init__(self, robot_config, driver_factory=FakeDriver):
         self.config = robot_config
         self.config.server.settling_dwell = 0.
         self.context = Context()
@@ -232,7 +315,7 @@ class RosFixture:
                    signal_handler_options=SignalHandlerOptions.NO)
         self.robot = RobotBridgeNode(robot_config, context=self.context)
         self.gateway = HttpGatewayNode(robot_config, context=self.context)
-        self.driver = FakeDriver(robot_config, context=self.context)
+        self.driver = driver_factory(robot_config, context=self.context)
         self.executor = SingleThreadedExecutor(context=self.context)
         self.stop_event = threading.Event()
         for node in (self.robot, self.gateway, self.driver):

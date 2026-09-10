@@ -17,9 +17,9 @@ sequenceDiagram
     participant ROS as Robot bridge
     participant Driver as Robot driver
     Live->>Agent: reset_arms
-    Agent->>HTTP: POST /v1/arms/reset
-    HTTP->>ROS: reset_arms
-    ROS->>Driver: All arm IDs, coordinated=true
+    Agent->>HTTP: POST /v1/move (all arms, named home)
+    HTTP->>ROS: move (named home)
+    ROS->>Driver: prepare then move named home targets for all arms
     Driver-->>Live: Completed result through ROS, HTTP and agent
     Live->>Agent: detect_targets(camera, instruction, arms)
     Agent->>HTTP: GET camera capture
@@ -33,14 +33,18 @@ sequenceDiagram
     opt Wrist refinement
         Live->>Agent: approach_targets(plan), then refine_grasp
         Agent->>ROS: Coordinated approach through HTTP
-        ROS->>Driver: Approach all plan arms
+        ROS->>Driver: prepare then move all plan arms to approach poses
         Agent->>ER: New wrist capture + refinement prompt
         ER-->>Agent: Refined grasp pixel
         Agent->>ROS: Refine plan using capture-time flange/camera TF
     end
     Live->>Agent: pick_targets(plan)
     Agent->>ROS: Execute pick through HTTP
-    ROS->>Driver: One request: open, approach, descend, close, lift
+    ROS->>Driver: prepare full pick sequence
+    loop open, approach, descend, close, lift
+        ROS->>Driver: move or gripper for all plan arms
+        Driver-->>ROS: Group completion; verify new measured state
+    end
     loop Each participating arm
         Live->>Agent: inspect_grasp(plan, arm)
         Agent->>ROS: Fresh post-pick wrist or fixed RGB observation and state through HTTP
@@ -50,7 +54,7 @@ sequenceDiagram
     Agent->>ROS: Record agent assessments with bound capture IDs through HTTP
     Live->>Agent: place_targets(plan)
     Agent->>ROS: Execute verified plan through HTTP
-    ROS->>Driver: One request: transfer, descend, open, retreat
+    ROS->>Driver: prepare then execute transfer, descend, open, retreat primitives
     Live->>Agent: Inspect fresh images/state and detect the next plan
 ```
 
@@ -72,21 +76,19 @@ all participating arms (one or two) and require coordinated execution in the dri
 | `reset_arms()` | Home all configured arms at normal startup |
 | `recover_arms()` | Stop all arms and request payload support/release, retreat and home before a new attempt |
 | `detect_targets(camera_id, instruction, arm_ids)` | Detect grasp/release points on one fixed-camera image and create a ROS2 plan |
-| `approach_targets(plan_id)` | Move all selected arms to driver-defined approach/observation poses |
+| `approach_targets(plan_id)` | Move all plan arms to approach poses generated from the configured task profile |
 | `refine_grasp(plan_id, arm_id, camera_id, instruction)` | Replace one grasp point using a new wrist image after approach; retain release points |
 | `pick_targets(plan_id)` | Coordinated opening, approach, descent, closing and lifting |
 | `inspect_grasp(plan_id, arm_id, camera_id?)` | Send one original post-pick wrist or fixed-camera image and current stationary arm state to the Live agent; return an observation ID |
 | `verify_grasp(plan_id, observations)` | Register the Live agent's per-arm `{arm_id, observation_id, success, reason}` assessments; enable placement only if all arms pass |
 | `place_targets(plan_id)` | Coordinated transfer, descent, opening and retreat after verification |
-| `move_arms(moves)` | Explicit coordinated metric flange poses for one or two arms |
-| `get_robot_state`, `move_arm`, `set_gripper`, `stop`, `finish_task` | Existing state, manual motion, stopping and session tools |
+| `move(targets, arm_ids or all_arms)` | Capture-bound pixel or named targets for one or two arms; no model-supplied poses |
+| `get_robot_state`, `gripper`, `stop`, `finish_task` | Existing state, manual motion, stopping and session tools |
 
-Add a tool declaration in `agent/embodiment/ros2/tools.py`, its implementation in
-`manipulation.py` (or `robot_client.py`), and dispatch in `ros2_embodiment.py`.
-New HTTP/ROS operations also need an API route, a strict body in `workflow.py`,
-validation in `protocol.py`, handling in `robot_node.py`, and driver support if
-motion is involved. The generic `RobotRequest.srv` does not need changing for
-new JSON operations. Add unit tests and a mocked-driver integration test.
+For tool visibility, dispatch and extension points, use the
+[adapter and tool extension guide](../server/docs/primitive-adapter.md#adding-and-exposing-tools).
+For each tool's preconditions, results and failure handling, see
+[tool outcomes](tool-results.md).
 
 ## Prompts and application instructions
 
@@ -108,6 +110,42 @@ The agent converts them to integer `[x, y]` original-image pixel centers using
 Live model nor ER provides depth or robot poses. ER receives the exact original
 JPEG, never the resized mosaic used by Live observations. Empty, malformed,
 out-of-bounds, blocked or incomplete detections do not create motion targets.
+
+Custom ER guidance can be supplied without editing source:
+
+```bash
+# From agent/, after configuring calibration, task profiles and backend positions.
+python run_ros2.py --config configs/primitives.json --model "$GEMINI_LIVE_MODEL" \
+  --er-detect-prompt-file prompt_examples/grasp_guidance.md \
+  --task-file apps/pick_and_place.md --instruction "Move the blue block onto the tray."
+```
+
+`--er-detect-prompt-file` and `--er-refine-prompt-file` append UTF-8 guidance to
+the respective built-in prompts. Files are read once at startup; missing/empty
+files fail before robot connection. Relative paths use the working directory.
+The Python API accepts `er_prompt_files={"detect": path, "refine": path}`.
+Customize contact preferences and visibility criteria; the built-in JSON fields
+and normalized coordinate contract remain mandatory. The tool's `instruction`
+provides the particular object/destination for each call.
+
+## Minimal setup
+
+One arm and one fixed camera can execute detect, pick, inspect, verify and place.
+Use matching agent/server configuration. `configs/primitives.json` includes
+illustrative plane calibration, task profiles and the `home` name-description
+catalog; replace calibration/clearances and implement the backend's named position
+and controller hooks before motion. For RGB-D, keep the camera/topology from
+`configs/minimal.json` and add the task profiles and name catalog described in
+[hardware configuration](../server/docs/primitive-adapter.md#hardware-configuration).
+The unmodified topology-only minimal file is not a complete pick/place setup.
+
+Inspection uses that fixed camera when no wrist camera is configured. The
+view must show the held object; occlusion is not success. Metric detection needs
+registered depth/CameraInfo/image-time TF, or fixed-plane calibration for points
+on that plane. RGB inspection itself requires neither depth nor TF. Follow the
+[server startup](../server/README.md#setup-and-startup) and
+[hardware bring-up](../server/docs/integration.md#4-bring-up-and-verify-the-integration)
+steps before starting the application command above.
 
 ## Agent-owned grasp assessment
 
@@ -169,8 +207,9 @@ support, invalid calibration or mismatched geometry fails conversion. Missing sy
 
 For pixel `(u,v)` with measured optical-axis depth `z`, the bridge computes
 `[(u-cx)*z/fx, (v-cy)*z/fy, z]`, then applies the frozen camera-to-world transform.
-This is a surface/contact point, **not a flange pose**. The driver applies tool
-geometry, grasp orientation, object/support offsets and approach clearances.
+This is a surface/contact point. The common compiler applies configured
+orientation and task clearances to generate a **TCP pose**; the backend handles
+its own tool calibration and controller target conversion.
 The same projection is used for destination support surfaces. Fixed cameras can
 alternatively use [offline plane calibration](../server/docs/plane-projection.md)
 with `projection: "plane"`; capture then needs only fresh RGB and the configured
@@ -204,9 +243,9 @@ without changing the converted points. Re-detect after scene changes.
 | `POST /v1/plans/refine` | `{plan_id, arm_id, capture_id, pixel: [x,y]}` |
 | `POST /v1/plans/execute` | `{plan_id, stage: "approach" \| "pick" \| "place"}` |
 | `POST /v1/plans/verify` | `{plan_id, observations: [{arm_id, capture_id, success: boolean}]}` |
-| `POST /v1/arms/reset` | Omitted body or `{}`; all configured arms |
+| `POST /v1/move` | `{all_arms:true, targets:[{kind:"named", name:"home"}]}` for startup home |
 | `POST /v1/arms/recover` | Omitted body or `{}`; all configured arms after successful all-arm stop |
-| `POST /v1/arms/poses` | `{moves: [{arm_id, frame_id, position, orientation, duration?}]}` |
+| `POST /v1/move`, `POST /v1/gripper` | Shared `arm_ids`/`all_arms` selection; see [target contract](../server/docs/primitive-adapter.md) |
 
 Plan responses include `success`, `plan_id`, `state`, and per-arm `targets` with
 `grasp`/`release` fields containing `frame_id`, `position`, `capture_id`, `pixel`
@@ -233,45 +272,34 @@ a stop of one arm does not resolve uncertainty about its peer.
 
 ## Coordinated driver contract
 
-The bridge sends one `RobotRequest` to `/robot_driver/execute` for each grouped
-operation. The driver must support:
+The common bridge expands approach/pick/place into deterministic steps, then
+sends `prepare` followed by `move`/`gripper` primitives to `server.driver_service`.
+The preparation includes every resolved step and participating arm. Pick uses
+`open`, `approach`, `descend`, `close`, `lift`; place uses `transfer`, `descend`,
+`open`, `retreat`. ER detection remains entirely on the agent side.
 
-- `reset_arms`: payload `{arm_ids, coordinated: true}`. Home all specified arms.
-- `move_arms`: payload `{moves, arm_ids, coordinated: true}`. Plan a common
-  trajectory and completion barrier for all requested flange poses.
-- `execute_plan`: payload `{plan_id, stage, targets, phases, coordinated: true}`.
-  `targets` contains all participating arms and their projected world contact
-  points. Plane-derived points also carry `projection: "plane"` and
-  `calibration_id`; accept these provenance fields in the driver adapter. `approach` uses `["approach"]`; `pick` uses
-  `["open", "approach", "descend", "close", "lift"]`; `place` uses
-  `["transfer", "descend", "open", "retreat"]`.
+Configure task orientations, clearances and a name-to-description `position_names`
+catalog in `server.hardware`. Register actual named coordinates and TCP
+calibration in the backend. The compiler converts contact points into TCP poses;
+the controller backend handles path planning, collision/force limits and
+physical group synchronization. Shared objects require preservation of relative
+grasp constraints. If any arm fails, stop the group and do not execute the next
+phase. Missing controller capabilities are rejected at preflight.
 
-Preflight the entire group before moving any arm. Synchronize every phase and
-barrier across both arms, including gripper closing, lifting and release. For
-shared objects, preserve the relative grasp constraint throughout transfer.
-Do not implement this contract as two unrelated sequential arm commands. If a
-member fails, stop the group; do not continue its peer's remaining phases.
-
-Return HTTP-style status 200 with
-`{"success": true, "coordinated": true, "completed_arm_ids": ["left", "right"]}`
-only after all phases finish. Every requested arm must appear exactly once.
-A plain `success: true` or a 202 acceptance is insufficient. Partial/failing
-execution must report failure, with `outcome: "unknown"` when appropriate.
-The bridge never retries motion, invalidates the plan on failure, and rejects
-new commands after unknown completion until all arms are stopped and recovered. Stage/reset/
-group-move requests use configurable execution/settling/state/delivery budgets
-(default 141-second bridge and 146-second agent budgets). See
-[time budgets](../server/docs/time-budgets.md). A successful driver motion reply is followed by a bounded wait for
-subsequent state measured at or after acknowledgement receipt from every target
-arm; this does not extend the original deadline. See
+Every primitive completion must confirm all requested arms, including singleton
+commands. The bridge checks new measured stationary state after each phase.
+All phases share the original execution/settling/state budget; no phase resets
+the deadline. A failed sequence requests a group stop with an independent stop
+budget. Cancellation of a ROS future alone does not stop hardware. Unknown
+outcomes require confirmed stop and recovery, followed by a new plan.
+See [time budgets](../server/docs/time-budgets.md) and
 [completion telemetry](../server/docs/telemetry.md#freshness-and-command-completion).
-Stopping physical motion is the driver's responsibility even if the
-ROS service future times out or is cancelled.
 
-This repository implements capture/projection, orchestration, requests and
-completion validation. It intentionally does not include a hardware controller,
-MoveIt planning, robot-specific home/grasp poses, force control or realtime
-synchronization. Those belong to the existing driver integration boundary.
+The [adapter guide](../server/docs/primitive-adapter.md) describes exact inputs,
+outputs, capability declarations and the hardware template. Partial stops expand
+to coupled groups even after their plan is invalidated. The repository supplies
+common orchestration; actual controllers, calibration and physical completion
+checks must be implemented and validated for the mechanism.
 
 ## Validation
 
@@ -287,10 +315,26 @@ that grasp assessment never calls ER, and that undelivered/incorrect evidence
 or a failed agent assessment cannot enable placement. These tests do not establish
 physical synchronization or comparative accuracy of the Live and ER models.
 
-See [tool lifecycle](tool-lifecycle.md) for exact triggers, supported camera
-selection, fault telemetry, the recovery operation, retry limits and external
-ER prompt customization. Stopping after a failed manipulation does not clear
-the recovery requirement: successful driver recovery is needed before retrying.
-
 See [tool outcomes and scenario coverage](tool-results.md) for each tool's
 completion/evidence source, final placement assessment and interruption policy.
+
+## Plan arm selection
+
+`detect_targets(camera_id, instruction, arm_ids)` explicitly selects the plan's
+participants. In a two-arm setup, `["left"]` or `["right"]` creates a one-arm
+plan; `["left", "right"]` creates a coupled two-arm plan. ER must return exactly
+one grasp/release pair per selected arm. `approach_targets`, `pick_targets` and
+`place_targets` take `plan_id` and act on **all and only that plan's arms**.
+They never implicitly include other configured arms, and cannot select a subset
+of an existing plan. To change participants, create a new plan after completing
+or safely recovering the current work.
+
+Both-arm plans require synchronized phases and shared-object constraints from
+the backend. They are not two independent pick operations; separate concurrent
+plans are not supported. `refine_grasp` updates one participating arm using its
+own wrist camera. Call `inspect_grasp` for each participant, then `verify_grasp`
+with exactly those arms. A one-arm plan needs only one assessment, including in
+a two-arm setup. All configured arms must keep publishing fresh telemetry. Motion health checks
+cover the selected arms; agent state observation and final task checks also
+consider faults on other configured arms. `reset_arms` and `recover_arms` always affect all
+configured arms; `stop` may expand to a coupled group.

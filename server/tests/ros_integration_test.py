@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from embodiment.ros2.test_requests import named_move
 from unittest import mock
 
 import httpx
@@ -32,16 +33,16 @@ class RosIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_motion_waits_for_driver_completion_and_stop_remains_available(self):
         self.fixture.driver.hold_moves = True
-        move = asyncio.create_task(self.http.post("/v1/arms/left/pose", json={
-            "frame_id": "world", "position": [0.1, 0, 0.3], "orientation": [0, 0, 0, 1]}))
+        move = asyncio.create_task(self.http.post('/v1/move', json=dict(arm_ids=['left'], targets=[dict(kind='pose', **{
+            "frame_id": "world", "position": [0.1, 0, 0.3], "orientation": [0, 0, 0, 1]})])))
         await eventually(lambda: bool(self.fixture.driver.held))
         self.assertFalse(move.done())
         state = await self.http.get("/v1/state")
         self.assertEqual(200, state.status_code)
-        stop = await asyncio.wait_for(self.http.post("/v1/stop", json={"arm_id": "left"}), timeout=2)
+        stop = await asyncio.wait_for(self.http.post("/v1/stop", json={"arm_ids": ["left"]}), timeout=2)
         self.assertTrue(stop.json()["success"])
         self.assertFalse((await move).json()["success"])
-        self.assertEqual(["move_arm", "stop"], [call[0] for call in self.fixture.driver.calls])
+        self.assertEqual(["prepare", "move", "stop"], [call[0] for call in self.fixture.driver.calls])
 
     async def test_multiple_camera_waiters_do_not_block_subscription_callbacks(self):
         responses = await asyncio.wait_for(asyncio.gather(*[
@@ -60,30 +61,30 @@ class RosIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_driver_timeout_does_not_retry_and_stop_still_works(self):
         self.fixture.driver.hold_moves = True
-        reply = await self.fixture.gateway.request("move_arm", "left", {
-            "frame_id": "world", "position": [0, 0, 0], "orientation": [0, 0, 0, 1]}, 0.1)
+        reply = await self.fixture.gateway.request('move', '', dict(arm_ids=["left"], targets=[dict(kind='pose', **{
+            "frame_id": "world", "position": [0, 0, 0], "orientation": [0, 0, 0, 1]})]) ,0.1)
         self.assertEqual(504, reply.status)
         self.assertEqual("unknown", reply.payload["outcome"])
-        self.assertEqual(1, len(self.fixture.driver.calls))
+        self.assertEqual(1, sum(c[0]=="move" for c in self.fixture.driver.calls))
         response = await self.http.post("/v1/stop", json={})
         self.assertTrue(response.json()["success"])
 
     async def test_invalid_internal_ros_request_is_rejected(self):
-        reply = await self.fixture.gateway.request("set_gripper", "missing", {"opening": 0.5}, 1)
-        self.assertEqual(404, reply.status)
+        reply = await self.fixture.gateway.request('gripper', '', dict(arm_ids=["missing"], **{"opening": 0.5}) ,1)
+        self.assertEqual(422, reply.status)
         self.assertEqual([], self.fixture.driver.calls)
 
     async def test_driver_rejection_and_async_acceptance_are_not_success(self):
         self.fixture.driver.reply_status = 409
         self.fixture.driver.reply_payload = {"success": False, "error": "Unreachable"}
-        response = await self.http.post("/v1/arms/right/gripper", json={"opening": 0.5})
+        response = await self.http.post('/v1/gripper', json=dict(arm_ids=['right'], **{"opening": 0.5}))
         self.assertEqual(409, response.status_code)
         self.fixture.driver.reply_status = 200
         self.fixture.driver.reply_payload = {"success": True}
         await self.http.post('/v1/stop', json={})
         self.assertTrue((await self.http.post('/v1/arms/recover')).json()['success'])
         self.fixture.driver.reply_status = 202
-        response = await self.http.post("/v1/arms/right/gripper", json={"opening": 0.5})
+        response = await self.http.post('/v1/gripper', json=dict(arm_ids=['right'], **{"opening": 0.5}))
         self.assertEqual(502, response.status_code)
         self.assertEqual("unknown", response.json()["outcome"])
 
@@ -93,9 +94,8 @@ class RosIntegrationTest(unittest.IsolatedAsyncioTestCase):
         robot_config = AgentConfig.load(str(ROOT / "agent/configs/dual_arm.json"))
         stream = MockGeminiStream([
             {"id": "state", "name": "get_robot_state", "args": {}},
-            {"id": "move", "name": "move_arm", "args": {"arm_id": "right", "frame_id": "world",
-                "position": [0.2, 0, 0.4], "orientation": [0, 0, 0, 1]}},
-            {"id": "grip", "name": "set_gripper", "args": {"arm_id": "right", "opening": 0.2}},
+            {"id": "move", "name": 'move', "args": named_move("right")},
+            {"id": "grip", "name": 'gripper', "args": dict(arm_ids=["right"],opening=0.2)},
             {"id": "state-final", "name": "get_robot_state", "args": {}},
             {"id": "done", "name": "finish_task", "args": {"success": True, "summary": "Completed"}},
         ])
@@ -106,7 +106,7 @@ class RosIntegrationTest(unittest.IsolatedAsyncioTestCase):
                     app=create_app(self.fixture.gateway, self.fixture.config)))
         self.assertTrue(result["success"])
         self.assertTrue(stream.closed)
-        self.assertEqual([("move_arm", "right"), ("set_gripper", "right")],
+        self.assertEqual([("prepare", ""), ("move", ""), ("prepare", ""), ("gripper", "")],
                          [(call[0], call[1]) for call in self.fixture.driver.calls])
         responses = [m["toolResponse"]["functionResponses"][0] for m in stream.messages if "toolResponse" in m]
         self.assertEqual(["state", "move", "grip", "state-final", "done"], [r["id"] for r in responses])
@@ -137,9 +137,8 @@ class TcpAgentIntegrationTest(unittest.IsolatedAsyncioTestCase):
             await eventually(lambda: server.started)
             robot_config = dataclasses.replace(AgentConfig.load(ROOT / "agent/configs/single_arm.json"), robot_url=address)
             stream = MockGeminiStream([
-                {"id": "move", "name": "move_arm", "args": {"arm_id": "arm", "frame_id": "world",
-                    "position": [0.2, 0, 0.4], "orientation": [0, 0, 0, 1]}},
-                {"id": "grip", "name": "set_gripper", "args": {"arm_id": "arm", "opening": 0.2}},
+                {"id": "move", "name": 'move', "args": named_move("arm")},
+                {"id": "grip", "name": 'gripper', "args": dict(arm_ids=["arm"],opening=0.2)},
                 {"id": "state-final", "name": "get_robot_state", "args": {}},
                 {"id": "done", "name": "finish_task", "args": {"success": True, "summary": "Completed"}},
             ])
@@ -148,7 +147,7 @@ class TcpAgentIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 result = await run_application(robot_config, "Move and grip", model="mock", api_key="mock-key", timeout=15)
             self.assertTrue(result["success"])
             self.assertTrue(stream.closed)
-            self.assertEqual([("move_arm", "arm"), ("set_gripper", "arm")],
+            self.assertEqual([("prepare", ""), ("move", ""), ("prepare", ""), ("gripper", "")],
                              [(call[0], call[1]) for call in fixture.driver.calls])
             self.assertTrue(any("realtimeInput" in message for message in stream.messages))
         finally:

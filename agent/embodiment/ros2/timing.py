@@ -40,13 +40,11 @@ class Timing:
             return self.camera_timeout
         if operation == 'stop':
             return self.stop_timeout
-        if operation == 'move_arm':
-            execution = payload.get('duration', 3.)
-        elif operation == 'move_arms':
-            execution = max(self.motion_timeout, max(m.get('duration', 3.) for m in payload['moves']))
-        elif operation in {'execute_plan', 'reset_arms', 'recover_arms'}:
+        if operation == 'move':
+            execution = max(self.motion_timeout, payload.get('duration', 3.))
+        elif operation in {'execute_plan', 'recover_arms'}:
             execution = self.motion_timeout
-        elif operation == 'set_gripper':
+        elif operation == 'gripper':
             execution = self.gripper_timeout
         else:
             return self.request_timeout

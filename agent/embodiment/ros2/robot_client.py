@@ -1,4 +1,4 @@
-"""HTTP contract for the future ROS2 node; no ROS2 runtime is needed here."""
+"""HTTP contract for the ROS2 bridge; no ROS2 runtime is needed here."""
 
 import asyncio
 import io
@@ -61,35 +61,64 @@ class Ros2RobotClient:
   async def get_robot_state(self):
     return await self._request("GET", "/v1/state")
 
-  async def move_arm(self, arm_id: str, frame_id: str, position: list,
-                     orientation: list, duration: float = 3.0):
-    self._arm(arm_id)
-    if frame_id not in self.config.frame_ids:
-      raise ValueError(f"Unknown coordinate frame: {frame_id}")
-    if not isinstance(position, list) or len(position) != 3:
-      raise ValueError("position must be [x, y, z] in metres")
-    if not isinstance(orientation, list) or len(orientation) != 4:
-      raise ValueError("orientation must be quaternion [x, y, z, w]")
-    position = [_number(value, "position") for value in position]
-    orientation = [_number(value, "orientation", -1, 1) for value in orientation]
-    if not math.isclose(sum(value * value for value in orientation), 1.0, abs_tol=1e-3):
-      raise ValueError("orientation must be a unit quaternion")
-    duration = _number(duration, "duration", 0.1, 60.0)
-    return await self._request("POST", f"/v1/arms/{arm_id}/pose", json={
-        "frame_id": frame_id, "position": position,
-        "orientation": orientation, "duration": duration,
-    }, timeout=self._budget("move_arm", {"duration": duration}))
+  def _selection(self, arm_ids=None, all_arms=False):
+    if type(all_arms) is not bool or (arm_ids is not None) == all_arms:
+      raise ValueError('Specify exactly one of arm_ids or all_arms=true')
+    if arm_ids is not None:
+      if (not isinstance(arm_ids,list) or not arm_ids or any(not isinstance(a,str) for a in arm_ids)
+          or len(set(arm_ids)) != len(arm_ids)):
+        raise ValueError('arm_ids must be a nonempty list of distinct arm IDs')
+      for arm in arm_ids:
+        self._arm(arm)
+    return dict(all_arms=True) if all_arms else dict(arm_ids=arm_ids)
 
-  async def set_gripper(self, arm_id: str, opening: float):
-    self._arm(arm_id)
-    return await self._request("POST", f"/v1/arms/{arm_id}/gripper", json={
-        "opening": _number(opening, "opening", 0.0, 1.0),
-    }, timeout=self._budget("set_gripper"))
+  async def move(self, targets, arm_ids=None, all_arms=False, duration=3.):
+    selection = self._selection(arm_ids,all_arms)
+    count = len(self.config.arms) if all_arms else len(arm_ids)
+    if not isinstance(targets,list) or len(targets) not in (1,count):
+      raise ValueError('Provide one shared target or one target per arm')
+    for target in targets:
+      if not isinstance(target, dict):
+        raise ValueError('Each target must be an object')
+      kind = target.get('kind')
+      fields = {
+          'pose': {'kind','frame_id','position','orientation','reference'},
+          'pixel': {'kind','capture_id','pixel','profile','offset_m'},
+          'named': {'kind','name'}}
+      if kind not in fields or target.keys() - fields[kind]:
+        raise ValueError('Unknown target kind or fields')
+      if kind == 'pose':
+        if target.get('frame_id') not in self.config.frame_ids:
+          raise ValueError(f"Unknown coordinate frame: {target.get('frame_id')}")
+        for key, count in (('position',3), ('orientation',4)):
+          values = target.get(key)
+          if not isinstance(values,list) or len(values) != count:
+            raise ValueError(f'{key} must contain {count} numbers')
+          for value in values:
+            _number(value,key)
+        if not math.isclose(sum(v*v for v in target['orientation']),1.,abs_tol=1e-3):
+          raise ValueError('orientation must be a unit quaternion')
+        if target.get('reference','flange') not in ('flange','tcp'):
+          raise ValueError('reference must be flange or tcp')
+      elif kind == 'pixel':
+        pixel = target.get('pixel')
+        if (not isinstance(pixel,list) or len(pixel)!=2 or any(type(v) is not int or v<0 for v in pixel)
+            or target.get('profile') != 'tabletop' or not isinstance(target.get('capture_id'),str)
+            or not target['capture_id']):
+          raise ValueError('Pixel target requires capture_id, nonnegative integer pixel pair and profile=tabletop')
+        _number(target.get('offset_m',0.),'offset_m',0.,1.)
+      elif not isinstance(target.get('name'),str) or not target['name']:
+        raise ValueError('Named target requires a nonempty name')
+    return await self._request('POST','/v1/move',json=dict(selection,targets=targets,
+        duration=_number(duration,'duration',.1,60.)),timeout=self._budget('move', {'duration': duration}))
 
-  async def stop(self, arm_id: str | None = None):
-    if arm_id is not None:
-      self._arm(arm_id)
-    return await self._request("POST", "/v1/stop", json={"arm_id": arm_id}, timeout=self._budget("stop"))
+  async def gripper(self, opening, arm_ids=None, all_arms=False):
+    return await self._request('POST','/v1/gripper',json=dict(self._selection(arm_ids,all_arms),
+        opening=_number(opening,'opening',0.,1.)),timeout=self._budget('gripper'))
+
+  async def stop(self, *, arm_ids=None, all_arms=None):
+    payload = self._selection(arm_ids, arm_ids is None if all_arms is None else all_arms)
+    return await self._request("POST", "/v1/stop", json=payload, timeout=self._budget("stop"))
 
   async def get_camera_snapshot(self, camera_id: str) -> bytes:
     if camera_id not in {camera.id for camera in self.config.cameras}:
@@ -142,10 +171,12 @@ class Ros2RobotClient:
     return result
 
   async def workflow(self, operation, **payload):
-    paths = {'recover': '/v1/arms/recover', 'reset': '/v1/arms/reset', 'create': '/v1/plans',
+    if operation == 'reset':
+      return await self.move(all_arms=True,targets=[dict(kind='named',name='home')])
+    paths = {'recover': '/v1/arms/recover', 'create': '/v1/plans',
              'refine': '/v1/plans/refine', 'execute': '/v1/plans/execute',
-             'verify': '/v1/plans/verify', 'move_arms': '/v1/arms/poses'}
-    return await self._request('POST', paths[operation], json=payload, timeout=self._budget({'create':'create_plan','refine':'refine_plan','verify':'verify_grasp','execute':'execute_plan','reset':'reset_arms','recover':'recover_arms','move_arms':'move_arms'}[operation], payload))
+             'verify': '/v1/plans/verify'}
+    return await self._request('POST', paths[operation], json=payload, timeout=self._budget({'create':'create_plan','refine':'refine_plan','verify':'verify_grasp','execute':'execute_plan','recover':'recover_arms'}[operation], payload))
 
   async def close(self):
     await self._client.aclose()
