@@ -32,9 +32,15 @@ class RoboticsER:
                                    transport=transport, timeout=self.timeout, follow_redirects=False)
 
   async def reason(self, mode, capture, instruction, arm_ids):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + self.timeout
     try:
       async with asyncio.timeout(self.timeout):
-        return await self._reason(mode, capture, instruction, arm_ids)
+        result = await self._reason(mode, capture, instruction, arm_ids)
+        # Cancellation can be suppressed and synchronous decoding can overrun.
+        if loop.time() >= deadline:
+          raise TimeoutError('Robotics ER completed after its deadline')
+        return result
     except TimeoutError as exc:
       raise httpx.ReadTimeout(f"Robotics ER elapsed deadline exceeded: {self.timeout}s") from exc
 

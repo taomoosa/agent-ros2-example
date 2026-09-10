@@ -231,7 +231,9 @@ class FakeDriver(Node):
                     self.image_publishers[camera.id].publish(message)
                     if self.publish_geometry:
                         info = CameraInfo(header=message.header, width=48, height=32,
-                            k=[100.,0.,24.,0.,100.,16.,0.,0.,1.])
+                            k=[100.,0.,24.,0.,100.,16.,0.,0.,1.],
+                            r=[1.,0.,0.,0.,1.,0.,0.,0.,1.],
+                            p=[100.,0.,24.,0.,0.,100.,16.,0.,0.,0.,1.,0.])
                         depth = DepthImage(header=message.header, width=48, height=32,
                             encoding='16UC1', step=96, data=(self.depth_data if self.depth_data is not None
                                 else struct.pack('<H', 1000)*48*32))

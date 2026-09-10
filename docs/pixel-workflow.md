@@ -194,7 +194,7 @@ sensor-data QoS; TF uses the standard dynamic/static TF publishers:
 
 | Topic | Message | Requirement |
 |---|---|---|
-| `/robotics/cameras/{id}/camera_info` | `sensor_msgs/CameraInfo` | Matching full rectified image grid; select rectified K or standard rectified P via [CameraInfo mode](../server/docs/camera-info.md). Cropping, nonidentity R and stereo offsets are unsupported |
+| `/robotics/cameras/{id}/camera_info` | `sensor_msgs/CameraInfo` | Matching full rectified image grid; use standard rectified P by default (nonzero raw lens D is accepted), or explicit normalized rectified K via [CameraInfo mode](../server/docs/camera-info.md). Cropping, nonidentity R and stereo offsets are unsupported |
 | `/robotics/cameras/{id}/depth/aligned` | `sensor_msgs/Image` | Color-grid/color-Z depth, matching dimensions, configured depth header frame and acquisition-time tolerance; `16UC1` millimetres or `32FC1` metres |
 | `/tf`, `/tf_static` | Standard TF messages | Transform from camera optical frame to world at image acquisition; additionally flange-to-world at that same time for wrist cameras |
 

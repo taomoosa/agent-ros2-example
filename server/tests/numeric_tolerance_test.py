@@ -236,3 +236,26 @@ class NumericToleranceTest(unittest.TestCase):
         data['server']['future_skew_tolerance_sec'] = .2
         with self.assertRaises(ValueError):
             RobotConfig.model_validate(data)
+
+    def test_default_accepts_lens_distortion_metadata_and_projects_rectified_pixels(self):
+        from embodiment.ros2.config import Camera as AgentCamera
+        from ros2_agent_server.numerics import rectified_intrinsics
+        self.assertEqual('ros_rectified',config('minimal.json').cameras[0].camera_info_mode)
+        self.assertEqual('ros_rectified',AgentCamera('c','optical','world','world').camera_info_mode)
+        g=self.g
+        g.config.cameras[0].camera_info_mode='ros_rectified'
+        g.info.p=[3.2,0.,1.1,0.,0.,3.4,.9,0.,0.,0.,1.,0.]
+        g.info.r=[1.,0.,0.,0.,1.,0.,0.,0.,1.]
+        for coefficients in ([-.28,.09,.001,-.002,-.015],[.12,-.04,0.,0.,.003],[.2,-.1,.01,-.005]):
+            g.info.d=coefficients
+            capture=g.capture()
+            point=g.store.project(capture['capture_id'],[2,1])['position']
+            for actual,expected in zip(point,[1.+.9*2./3.2,2.+.1*2./3.4,5.]):
+                self.assertAlmostEqual(expected,actual,delta=1e-6)
+        g.info.d=[float('nan')]
+        with self.assertRaisesRegex(ValueError,'camera_info.d'):g.capture()
+        g.info.d=[-.28,.09,.001,-.002,-.015]
+        g.info.p=[0.]*12
+        with self.assertRaisesRegex(ValueError,'calibrated rectified P'):g.capture()
+        g.config.cameras[0].camera_info_mode='rectified_k'
+        with self.assertRaisesRegex(ValueError,'ros_rectified'):g.capture()

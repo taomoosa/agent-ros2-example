@@ -167,3 +167,16 @@ spend the original remaining budget. No phase restarts the motion timeout.
 Failure initiates a group stop using the independent stop budget; this can make
 failure handling extend beyond the motion deadline. See
 [primitive sequence and stop semantics](primitive-adapter.md).
+
+HTTP and ER completion also recheck the elapsed deadline after transport and
+synchronous JSON decoding. A custom transport that absorbs cancellation cannot
+turn a late response into success. Late motion replies remain unknown outcomes
+and trigger stop/recovery; they are not replayed. Evidence TTLs remain independent
+of ER and model-idle budgets: an on-time ER response can still refer to an expired
+capture, and delayed model thinking can outlive a detected plan. Obtain new
+capture/plan evidence through the normal lifecycle in those cases.
+
+`latency_scenario_test.py` covers expired evidence, delayed ER/Live/controller
+work with RGB-depth skew and settling, stop during ER, and independently timed
+noisy dual-arm telemetry. Agent `late_response_test.py` covers late Live replies,
+HTTP/ER cancellation suppression and slow decoding, including no motion replay.

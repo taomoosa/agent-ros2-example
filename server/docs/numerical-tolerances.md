@@ -16,7 +16,7 @@ Add the camera fields to each relevant entry in `cameras`; add the clock field t
 | Camera `sync_tolerance_sec` | `0.01` | Seconds; absolute RGB/depth stamp difference. Range 0..0.1; 0 restores strict matching |
 | `server.future_skew_tolerance_sec` | `0.005` | Seconds; maximum future lead of RGB/depth/state relative to the bridge clock. Range 0..0.1; 0 disables the allowance |
 | Camera `calibration_tolerance_px` | `0.000001` | Pixels; absolute change in K's fx, fy, cx, cy from the accepted baseline. Range 0..0.01 |
-| Camera `rectification_tolerance` | `0.000000001` | Absolute residual in D and K's structural zero/one elements. Range 0..0.000001 |
+| Camera `rectification_tolerance` | `0.000000001` | Structural zero/one residuals in projection/rectification matrices; also near-zero D only in explicit rectified_k mode. Not a lens-distortion bound. Range 0..0.000001 |
 | Camera `depth_min_m` / `depth_max_m` | `0.05` / `5.0` | Metres along color optical Z; inclusive validated working range, with 0 < min < max |
 | Camera `depth_absolute_tolerance_m` | `0.02` | Metres; fixed part of local depth agreement. Range 0..0.1 |
 | Camera `depth_relative_tolerance` | `0.01` | Fraction of selected depth; range 0..0.1. Added to the fixed part |
@@ -65,9 +65,9 @@ exact. A change from valid to invalid rectification residuals is never hidden by
 a tolerant comparison. Plane homography conditioning and horizon checks retain
 their existing numerical bounds.
 
-The default is the **rectified K input contract**. `camera_info_mode=ros_rectified`
-uses standard rectified P with identity R and zero projection translation, and
-permits raw-image K/D to differ. Unsupported stereo/cropped/rotated geometry is
+The default is **ros_rectified**, using calibrated P with identity R and zero
+projection translation, and permitting nonzero raw-image D and differing K.
+Normalized K-only adapters must explicitly select `camera_info_mode=rectified_k`. Unsupported stereo/cropped/rotated geometry is
 rejected; see [CameraInfo modes](camera-info.md). A tolerance does not implement
 rectification or registration.
 

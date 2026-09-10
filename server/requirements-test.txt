@@ -1,2 +1,3 @@
+# Both runtimes are required by the Gemini/HTTP/ROS integration tests.
 -r requirements.txt
 -r ../agent/requirements.txt

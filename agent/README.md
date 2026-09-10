@@ -64,6 +64,11 @@ Timing is read from the shared configuration’s `server` object. See
 [operation deadlines, camera waits and shutdown](../server/docs/time-budgets.md).
 The application defaults to a 900-second total limit (`--timeout`).
 
+Camera mount metadata selects fixed-camera versus wrist workflows; TF geometry
+is handled by the server. See [attachment and input requirements](../server/docs/integration.md#camera-attachment-metadata-and-tf).
+CameraInfo defaults to `ros_rectified` with nonzero raw lens D and calibrated P;
+normalized K-only publishers must select `rectified_k` explicitly.
+
 ## Tests
 
 Run the tests from `agent/` with the virtual environment activated:

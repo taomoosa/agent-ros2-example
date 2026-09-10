@@ -127,7 +127,9 @@ class HardwareIntegrationTest(unittest.IsolatedAsyncioTestCase):
         rgb.header.frame_id = camera.optical_frame
         rgb.header.stamp.sec, rgb.header.stamp.nanosec = divmod(stamp, 1_000_000_000)
         info = CameraInfo(header=copy.deepcopy(rgb.header), width=48, height=32,
-                          k=[100.,0.,24.,0.,100.,16.,0.,0.,1.])
+                          k=[100.,0.,24.,0.,100.,16.,0.,0.,1.],
+            r=[1.,0.,0.,0.,1.,0.,0.,0.,1.],
+            p=[100.,0.,24.,0.,0.,100.,16.,0.,0.,0.,1.,0.])
         depth = Image(header=copy.deepcopy(rgb.header), width=48, height=32,
                       encoding='16UC1', step=96, data=struct.pack('<H',1000)*48*32)
         depth.header.frame_id = camera.depth_frame

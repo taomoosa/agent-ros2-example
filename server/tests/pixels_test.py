@@ -15,6 +15,8 @@ from ros2_agent_server.state import CameraFrame
 class PixelProjectionTest(unittest.TestCase):
     def setUp(self):
         self.config = RobotConfig.load(Path(__file__).resolve().parents[2] / 'agent/configs/dual_arm.json')
+        for camera in self.config.cameras:
+            camera.camera_info_mode = "rectified_k"
         self.config.server.capture_ttl = 120.
         self.config.server.plan_ttl = 120.
         self.now = 0.

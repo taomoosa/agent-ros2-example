@@ -34,13 +34,22 @@ configuration and bring-up checks. For a fixed camera with unreliable depth,
 [extension guide](docs/primitive-adapter.md#adding-and-exposing-tools) for the exact server/agent files to change,
 validation and motion lifecycle requirements, and tests to extend.
 
+CameraInfo defaults to `ros_rectified`: supply rectified RGB and calibrated P/R;
+nonzero raw lens D is accepted. Existing normalized K-only publishers must set
+`camera_info_mode: "rectified_k"` explicitly. See [camera input modes](docs/camera-info.md)
+and [mount metadata versus TF](docs/integration.md#camera-attachment-metadata-and-tf).
+
 ## Setup and startup
 
 The reference environment is Ubuntu 24.04, ROS2 Jazzy, and Python 3.12.
 Install ROS2 at the OS level; `rclpy` does not need to be installed with pip.
 Building requires colcon, ament_cmake, ament_python,
 rosidl_default_generators, sensor_msgs, std_msgs, and tf2_ros. The integration
-tests also use geometry_msgs and TF broadcasters.
+tests also use geometry_msgs and TF broadcasters. ROS runtime/test dependencies
+are declared in package.xml; install them through the ROS environment. Pip
+requirements cover Python libraries only, and requirements-test.txt includes
+both server and agent requirements for the combined tests. No Gemini SDK is
+needed: ER uses httpx and Live uses websocket-client.
 
 Run from the repository root:
 

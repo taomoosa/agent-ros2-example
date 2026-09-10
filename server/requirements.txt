@@ -1,3 +1,4 @@
+# Python server runtime. Install rclpy, tf2_ros and ROS message packages via ROS2.
 fastapi>=0.115.0,<1
 uvicorn>=0.30.0,<1
 pydantic>=2.0.0,<3

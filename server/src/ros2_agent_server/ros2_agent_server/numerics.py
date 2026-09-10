@@ -8,14 +8,15 @@ from .protocol import BridgeError
 
 
 def rectified_intrinsics(info, camera):
-    """Accept only rounding residuals, then canonicalize the rectified K matrix."""
+    """Use rectified P by default; raw lens D is metadata, not a zero residual."""
     tolerance = camera.rectification_tolerance
     require(len(info.k) == 9, "camera_info.k.length", 9, len(info.k))
     for i, value in enumerate(info.k):
         require(math.isfinite(value), f"camera_info.k[{i}]", "finite", value)
     if camera.camera_info_mode == 'ros_rectified':
-        p, r = list(info.p), list(info.r)
-        require(len(p) == 12 and all(math.isfinite(v) for v in p), "camera_info.p", "12 finite values", p)
+        p, r = list(getattr(info, "p", [])), list(getattr(info, "r", []))
+        require(len(p) == 12 and all(math.isfinite(v) for v in p) and p[0] > 0 and p[5] > 0,
+                "camera_info.p", "calibrated rectified P with positive fx/fy; use rectified_k only for normalized K-only adapters", p)
         require(len(r) == 9 and all(math.isfinite(v) and abs(v-(1. if i in (0,4,8) else 0.)) <= tolerance
                                    for i,v in enumerate(r)), "camera_info.r", "identity rectification rotation", r)
         require(all(abs(p[i]) <= tolerance for i in (3,7,11)), "camera_info.p.translation",
@@ -24,7 +25,7 @@ def rectified_intrinsics(info, camera):
         k = [p[i] for i in (0,1,2,4,5,6,8,9,10)]
     else:
         require(all(math.isfinite(v) and abs(v) <= tolerance for v in info.d),
-                "camera_info.d", f"finite rectified residuals within {tolerance}", list(info.d))
+                "camera_info.d", f"finite rectified residuals within {tolerance}; for original lens D with rectified images, use camera_info_mode=ros_rectified and calibrated P", list(info.d))
         k = list(info.k)
         r = list(getattr(info, 'r', []))
         if any(r):

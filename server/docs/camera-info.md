@@ -6,8 +6,33 @@ to use its offline homography and original image grid.
 
 | Mode | Required input and projection |
 |---|---|
-| `rectified_k` (default) | Adapter supplies rectified pinhole K and D within the numerical zero tolerance. A supplied nonzero P must agree with K; inconsistent P is rejected |
-| `ros_rectified` | Already rectified RGB plus registered color-grid/color-Z depth. Use fx/fy/cx/cy from P, even when raw-image K differs and D is nonzero |
+| `rectified_k` (explicit adapter mode) | Adapter supplies rectified pinhole K and D within the numerical zero tolerance. A supplied nonzero P must agree with K; inconsistent P is rejected |
+| `ros_rectified` (default) | Already rectified RGB plus registered color-grid/color-Z depth. Use fx/fy/cx/cy from P, even when raw-image K differs and D is nonzero |
+
+The default accepts finite, nonzero lens distortion coefficients such as
+`D=[-0.28,0.09,0.001,-0.002,-0.015]`. This is an illustrative calibrated lens,
+not a universal acceptance limit. ROS CameraInfo describes the raw lens with
+D/K and the rectified image with P; the driver may retain nonzero D even when
+publishing rectified images. Projection uses P, so these coefficients must not
+be rejected merely for exceeding a near-zero rounding tolerance. See the
+[ROS CameraInfo definition](https://github.com/ros2/common_interfaces/blob/jazzy/sensor_msgs/msg/CameraInfo.msg).
+
+Supply an actually rectified JPEG stream and depth registered to its grid and
+optical Z. Merely allowing nonzero D does not undistort raw pixels. Raw image
+sources need upstream rectification, for example
+[image_proc RectifyNode](https://github.com/ros-perception/image_pipeline/blob/jazzy/image_proc/doc/components.rst).
+The server does not impose a universal maximum D: coefficient magnitude depends
+on the distortion model/calibration and is not an image-error bound.
+
+Migration: `camera_info_mode` now defaults to `ros_rectified`. A K-only adapter
+must explicitly set `"camera_info_mode":"rectified_k"` and continue supplying
+normalized rectified K/D. A standard CameraInfo publisher supplies calibrated P
+and identity R. Missing/zero P fails explicitly rather than falling back to raw
+K and silently misprojecting. `rectification_tolerance` still bounds structural
+matrix rounding (and near-zero D only in explicit K-only mode); increasing it
+is not a substitute for lens correction. Plane projection still requires its
+calibration image grid; this mode change does not add nonlinear lens correction
+to a homography.
 
 In `ros_rectified`, the bridge currently requires identity R and zero P
 translation (monocular Tx/Ty). Nonidentity R, stereo offsets, cropped ROI and

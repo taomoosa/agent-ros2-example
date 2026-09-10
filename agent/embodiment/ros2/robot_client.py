@@ -39,24 +39,31 @@ class Ros2RobotClient:
   async def _request(self, method: str, path: str, **kwargs) -> dict[str, Any]:
     # Motion requests are deliberately sent once: a timeout has an unknown outcome.
     budget = kwargs.pop('timeout', self.config.timing.request_timeout+self.config.timing.ros_response_margin+self.config.timing.http_response_margin)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget
     try:
       async with asyncio.timeout(budget):
         response = await self._client.request(method, path, timeout=budget, **kwargs)
+        if loop.time() >= deadline:
+          raise TimeoutError('HTTP response arrived after its deadline')
+        response.raise_for_status()
+        if response.status_code != 200:
+          return {"success": False, "outcome": "unknown",
+                  "error": "Expected completed operation; asynchronous acceptance is unsupported"}
+        try:
+          result = response.json()
+          if not isinstance(result, dict):
+            raise ValueError("The robot server must return a JSON object")
+          if method == 'POST' and type(result.get('success')) is not bool:
+            raise ValueError("The robot server must report boolean completion")
+        except ValueError as exc:
+          raise httpx.RemoteProtocolError(str(exc), request=response.request) from exc
+        # Synchronous decoding must not turn an expired response into success.
+        if loop.time() >= deadline:
+          raise TimeoutError('HTTP response decoding exceeded its deadline')
+        return result
     except TimeoutError as exc:
       raise httpx.ReadTimeout(f"Request elapsed deadline exceeded: {budget}s", request=httpx.Request(method, self.config.robot_url+path)) from exc
-    response.raise_for_status()
-    if response.status_code != 200:
-      return {"success": False, "outcome": "unknown",
-              "error": "Expected completed operation; asynchronous acceptance is unsupported"}
-    try:
-      result = response.json()
-      if not isinstance(result, dict):
-        raise ValueError("The robot server must return a JSON object")
-      if method == 'POST' and type(result.get('success')) is not bool:
-        raise ValueError("The robot server must report boolean completion")
-    except ValueError as exc:
-      raise httpx.RemoteProtocolError(str(exc), request=response.request) from exc
-    return result
 
   async def get_robot_state(self):
     return await self._request("GET", "/v1/state")

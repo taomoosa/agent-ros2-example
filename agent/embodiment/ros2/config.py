@@ -37,13 +37,14 @@ class Arm:
 class Camera:
   id: str
   optical_frame: str
+  # HARDWARE INTEGRATION: logical ownership, not the optical link's immediate TF parent.
   mount: str
   parent_frame: str
   arm_id: str | None = None
   depth_frame: str | None = None
   camera_info_frame: str | None = None
   depth_geometry: str = "color_optical_z"
-  camera_info_mode: str = "rectified_k"
+  camera_info_mode: str = "ros_rectified"
   sync_tolerance_sec: float = 0.01
   calibration_tolerance_px: float = 1e-6
   rectification_tolerance: float = 1e-9

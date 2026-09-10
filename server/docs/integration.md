@@ -73,7 +73,7 @@ The `server` object is optional. The agent can load the same topology file.
 | `server.remappings` | One map of original absolute ROS names to hardware endpoint names, shared by both server roles; see [ROS names](ros-names.md) |
 | Camera numerical settings / `server.future_skew_tolerance_sec` | See [numerical tolerances](numerical-tolerances.md) for calibration, depth quality and clock-skew limits |
 | `server` timing fields | Configure motion, settling, state, transport and model deadlines together; see [time budgets and driver monitor](time-budgets.md) |
-| Camera `camera_info_mode` | Select legacy rectified K or standard rectified P; see [CameraInfo integration](camera-info.md) |
+| Camera `camera_info_mode` | Default ros_rectified uses standard P and accepts nonzero lens D; select rectified_k only for normalized K-only adapters; see [CameraInfo integration](camera-info.md) |
 | `server.state_max_age` | Maximum state measurement and receipt age in seconds, greater than zero and at most 60; publish faster than this with margin |
 | `server.camera_timeout` | Wait budget for image/observation/capture in seconds, greater than zero and at most 3600; default 5 |
 | `server.camera_buffer_size` | Entries retained per RGB/depth buffer, 2..256, default 32; allow for delayed and reordered delivery |
@@ -84,6 +84,39 @@ Frame IDs must be nonempty and have no leading slash. Mount declarations do not
 publish TF or calibrate cameras. Use `server.hardware.profiles` for tabletop task geometry and `position_names`
 for a name-to-description catalog without coordinates. Named coordinates, TCP calibration, controller limits
 and recovery belong to the backend; see its separate configuration example. Other unknown fields are rejected by [RobotConfig](../src/ros2_agent_server/ros2_agent_server/models.py).
+
+### Camera attachment metadata and TF
+
+`optical_frame` names the coordinate frame of the RGB optical center. TF must
+provide `world <- optical_frame` at the image acquisition time, through any
+valid intermediate links. Its optical axes are x right, y down, z forward.
+For a wrist camera, also provide the measured `world <- flange_frame` transform
+at acquisition time. The mount transform must be calibrated; a connected but
+incorrect TF tree still produces incorrect grasp positions.
+
+`mount`, `parent_frame` and `arm_id` describe workflow ownership, not another
+transform. `mount: "world"` selects fixed-camera detection/plane eligibility;
+`mount: "flange"` with `arm_id` selects that arm's wrist refinement, inspection
+fallback and approximate-capture stationary-state checks. It prevents using one
+arm's wrist evidence for the other arm. `parent_frame` is the logical anchor
+(world or the owning flange); it need not be the immediate TF parent of the
+optical link. A chain such as `flange -> camera_link -> optical_frame` is valid.
+These JSON fields do not publish TF or prove that the physical camera is fixed.
+
+The HTTP-only agent has no TF tree to infer this ownership from. A wrist frame
+also connects to world, so simple world connectivity alone cannot distinguish
+it from a fixed camera. Keep these metadata consistent with the real mounting.
+No duplicate camera transform is entered in JSON for depth projection.
+
+TF attachment alone is sufficient for neither `/capture` nor the complete tool
+workflow. Supply the remapped image topic with correct optical header, measured
+acquisition time and fresh data. Depth projection additionally needs rectified
+RGB, registered color-grid depth and matching calibrated CameraInfo (P by
+default); all sources share the ROS clock. Wrist approximate captures also need
+fresh measured arm state spanning the exposures. Fixed-plane projection uses
+its configured calibration instead of depth/TF. RGB-only `/observation` needs
+no depth/TF; existing tool/state guards still apply. See
+[camera modes](camera-info.md) and [synchronization diagnostics](synchronization.md).
 
 ## 2. Provide telemetry, images and capture geometry
 

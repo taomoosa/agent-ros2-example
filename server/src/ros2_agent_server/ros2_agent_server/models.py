@@ -89,6 +89,7 @@ class Arm(Model):
 class Camera(Model):
     id: str = Field(pattern=r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
     optical_frame: str = Field(min_length=1)
+    # HARDWARE INTEGRATION: logical ownership, not the optical link's immediate TF parent.
     mount: str
     parent_frame: str = Field(min_length=1)
     arm_id: str | None = None
@@ -96,7 +97,7 @@ class Camera(Model):
     camera_info_frame: str | None = None
     # An alias declares color-grid pixels AND color optical-axis Z, not raw depth.
     depth_geometry: Literal["color_optical_z"] = "color_optical_z"
-    camera_info_mode: Literal["rectified_k", "ros_rectified"] = "rectified_k"
+    camera_info_mode: Literal["rectified_k", "ros_rectified"] = "ros_rectified"
     sync_tolerance_sec: float = Field(default=0.01, ge=0.0, le=0.1)
     calibration_tolerance_px: float = Field(default=1e-6, ge=0.0, le=0.01)
     rectification_tolerance: float = Field(default=1e-9, ge=0.0, le=1e-6)
